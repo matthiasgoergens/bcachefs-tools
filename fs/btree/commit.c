@@ -447,7 +447,7 @@ btree_key_can_insert_cached_slowpath(struct btree_trans *trans,
 		struct bkey_i *new_k	= kmalloc(new_u64s * sizeof(u64), GFP_NOWAIT);
 		if (unlikely(!new_k)) {
 			bch2_trans_unlock_updates_write(trans);
-			bch2_trans_unlock(trans);
+			bch2_trans_unlock_long(trans);
 
 			new_k = kmalloc(new_u64s * sizeof(u64), GFP_KERNEL);
 			if (!new_k) {
