@@ -231,6 +231,11 @@ enum fsck_err_opts {
 	  OPT_UINT(0, 15),						\
 	  BCH_SB_EC_MAX_DATA_BLOCKS,	0,				\
 	  NULL,		"Cap data blocks per EC stripe (0 = use all active devs)")\
+	x(background_dedup,		u8,				\
+	  OPT_FS|OPT_INODE|OPT_FORMAT|OPT_MOUNT_OLD|OPT_RUNTIME,	\
+	  OPT_BOOL(),							\
+	  BCH_SB_BACKGROUND_DEDUP,	false,				\
+	  NULL,		"Enable background deduplication")	\
 	x(casefold,			u8,				\
 	  OPT_FS|OPT_INODE|OPT_FORMAT,					\
 	  OPT_BOOL(),							\

@@ -181,6 +181,8 @@ struct bch_val {
 	__u64		__nothing[0];
 };
 
+#include "data/dedup_format.h"
+
 struct bversion {
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 	__u64		lo;
@@ -473,7 +475,9 @@ enum bch_bkey_type_flags {
 	  "Whiteout specific to the extents btree, blocking "		\
 	  "visibility of ancestor snapshot extent versions")		\
 	x(logged_op_stripe_update, 37,	BKEY_TYPE_strict_btree_checks,	\
-	  "Logged stripe creation/update operation for crash recovery")
+	  "Logged stripe creation/update operation for crash recovery")	\
+	x(dedup,		38,	0,				\
+	  "Dedup index entry linking a checksum to a source extent")
 
 enum bch_bkey_type {
 #define x(name, nr, ...) KEY_TYPE_##name	= nr,
@@ -759,6 +763,9 @@ enum btree_id_flags {
 	  BTREE_IS_write_buffer,						\
 	  BIT_ULL(KEY_TYPE_backpointer),					\
 	  "Stripe backpointers")					\
+	x(dedup,		28,	0,					\
+	  BIT_ULL(KEY_TYPE_dedup),						\
+	  "Deduplication index mapping checksums to reflink entries")
 
 enum btree_id {
 #define x(name, nr, ...) BTREE_ID_##name = nr,
@@ -1082,7 +1089,10 @@ LE64_BITMASK(BCH_SB_EXT_BTREE_CACHE_SHRINKER_SEEKS,
 	  "about fragmentation per device",			"2026-07")	\
 	x(journal_data_epoch,		BCH_VERSION(1, 40),			\
 	  "Desktop-mode ordered flush: per-commit data epoch tag "		\
-	  "for crash-consistent rewind boundaries",		"2026-06")
+	  "for crash-consistent rewind boundaries",		"2026-06")	\
+	x(dedup,			BCH_VERSION(1, 41),			\
+	  "Background deduplication via checksum-indexed "			\
+	  "reflinks",						"2026-07")
 
 enum bcachefs_metadata_version {
 	bcachefs_metadata_version_min = 9,
@@ -1261,6 +1271,7 @@ LE64_BITMASK(BCH_SB_EXTENT_BP_SHIFT,	struct bch_sb, flags[6], 40, 48);
 LE64_BITMASK(BCH_SB_SCRUB_JOURNAL,	struct bch_sb, flags[6], 48, 50);
 LE64_BITMASK(BCH_SB_EC_MAX_DATA_BLOCKS,	struct bch_sb, flags[6], 50, 58);
 LE64_BITMASK(BCH_SB_MOVE_WRITES_FUA,	struct bch_sb, flags[6], 58, 59);
+LE64_BITMASK(BCH_SB_BACKGROUND_DEDUP,	struct bch_sb, flags[6], 59, 60);
 
 #define BCH_SB_EXTENT_BP_SHIFT_DEFAULT	10
 
@@ -1834,6 +1845,7 @@ static inline bool btree_id_can_reconstruct(enum btree_id btree)
 	case BTREE_ID_reconcile_pending:
 	case BTREE_ID_reconcile_scan:
 	case BTREE_ID_subvolume_children:
+	case BTREE_ID_dedup:
 		return true;
 	default:
 		return false;

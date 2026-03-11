@@ -457,7 +457,7 @@ static inline bool bkey_should_have_rb_opts(struct bkey_s_c k,
 		BCH_RECONCILE_OPTS()
 #undef x
 	}
-	return new.need_rb;
+	return new.need_rb || new.dedup_pending;
 }
 
 static int bch2_bkey_needs_reconcile(struct btree_trans *trans, struct bkey_s_c k,
@@ -579,6 +579,14 @@ static int bch2_bkey_needs_reconcile(struct btree_trans *trans, struct bkey_s_c 
 	 * the block and restores it - so don't pad with placeholders for
 	 * durability the stripe will get back on its own.
 	 */
+	/*
+	 * Dedup: set dedup_pending when the extent has a checksum and
+	 * background_dedup is enabled.  Skip reflink pointers (already
+	 * indirect), btree pointers, and extents without checksums.
+	 *
+	 * Actual assignment deferred below, after 'old' is available.
+	 */
+
 	*need_update_invalid_devs =
 		min_t(int, max(durability_acct, ec_redundancy + 1) + invalid - r.data_replicas, invalid);
 
@@ -590,6 +598,7 @@ static int bch2_bkey_needs_reconcile(struct btree_trans *trans, struct bkey_s_c 
 	const struct bch_extent_reconcile *old = bch2_bkey_ptrs_reconcile_opts(c, ptrs);
 	if (old && !(old->need_rb & ~r.need_rb)) {
 		r.pending = old->pending;
+		r.dedup_pending = old->dedup_pending;
 		if (r.hipri && !old->hipri)
 			r.pending = 0;
 	}
@@ -848,6 +857,16 @@ int bch2_bkey_set_needs_reconcile(struct btree_trans *trans,
 		}
 
 		*old = new;
+
+		/*
+		 * Dedup: only set dedup_pending on foreground writes,
+		 * not on reconcile-triggered updates of existing extents.
+		 */
+		if (ctx == SET_NEEDS_RECONCILE_foreground &&
+		    opts->background_dedup &&
+		    k.k->type != KEY_TYPE_reflink_p &&
+		    opts->data_checksum)
+			old->dedup_pending = 1;
 	} else if (old)
 		extent_entry_drop(c, k, (union bch_extent_entry *) old);
 

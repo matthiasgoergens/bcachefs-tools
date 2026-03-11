@@ -3,6 +3,7 @@
 #define _BCACHEFS_BKEY_TYPES_H
 
 #include "bcachefs_format.h"
+#include "data/dedup_format.h"
 
 /* DOC_LATEX(bkey-structures)
  *

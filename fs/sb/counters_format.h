@@ -284,7 +284,17 @@ enum bch_counters_flags {
 	x(accounting_key_to_wb_slowpath,	94,  TYPE_COUNTER,	\
 	  "Accounting key to write buffer slow path")			\
 	x(error_throw,				93,  TYPE_COUNTER,	\
-	  "Errors thrown")
+	  "Errors thrown")						\
+	x(dedup_extent_indexed,			136, TYPE_COUNTER,	\
+	  "Extents indexed in dedup table")				\
+	x(dedup_extent_deduped,			137, TYPE_COUNTER,	\
+	  "Extents deduplicated (converted to reflinks)")		\
+	x(dedup_sectors_saved,			138, TYPE_SECTORS,	\
+	  "Sectors saved by deduplication")				\
+	x(dedup_byte_verify_mismatch,		139, TYPE_COUNTER,	\
+	  "Dedup checksum matches rejected by byte-verify")		\
+	x(dedup_stale_entry,			140, TYPE_COUNTER,	\
+	  "Stale dedup index entries replaced")
 
 enum bch_persistent_counters {
 #define x(t, n, ...) BCH_COUNTER_##t,

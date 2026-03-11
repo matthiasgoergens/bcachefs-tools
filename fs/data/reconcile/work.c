@@ -15,6 +15,7 @@
 
 #include "data/compress.h"
 #include "data/copygc.h"
+#include "data/dedup.h"
 #include "data/ec/create.h"
 #include "data/ec/trigger.h"
 #include "data/move.h"
@@ -846,6 +847,21 @@ static int __do_reconcile_extent(struct moving_context *ctxt,
 	CLASS(disk_reservation, res)(c);
 	try(bch2_trans_commit_lazy(trans, &res.r, NULL, BCH_TRANS_COMMIT_no_enospc));
 
+	const struct bch_extent_reconcile *r = bch2_bkey_reconcile_opts(c, k);
+
+	if (r && r->dedup_pending) {
+		int dedup_ret = bch2_dedup_extent(ctxt, opts, iter, k);
+		if (dedup_ret)
+			return dedup_ret;
+
+		/* The key might have been modified by dedup, re-read */
+		k = bkey_try(bch2_btree_iter_peek_slot(iter));
+		if (!k.k)
+			return 0;
+		if (!bkey_extent_is_direct_data(k.k))
+			return 0;
+	}
+
 	int ret = reconcile_set_data_opts(trans, iter, level, k, opts, data_opts);
 	if (ret <= 0)
 		return ret;
@@ -906,11 +922,10 @@ static int do_reconcile_extent(struct moving_context *ctxt,
 
 	/* We require holding an intent lock when calling
 	 * bch2_stripe_handle_tryget(), to avoid racing with the stripe trigger
-	 * deleting the stripe */
-	enum btree_iter_update_trigger_flags flags = data_pos.btree == BTREE_ID_stripes
-		? BTREE_ITER_intent : 0;
-
-	CLASS(btree_iter, iter)(trans, data_pos.btree, data_pos.pos, BTREE_ITER_all_snapshots|flags);
+	 * deleting the stripe. Dedup also needs intent to update extents.
+	 */
+	CLASS(btree_iter, iter)(trans, data_pos.btree, data_pos.pos,
+			       BTREE_ITER_all_snapshots|BTREE_ITER_intent);
 	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_slot(&iter));
 	if (!k.k)
 		return 0;

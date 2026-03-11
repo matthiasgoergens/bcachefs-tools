@@ -90,7 +90,8 @@ struct bch_extent_rebalance_v1 {
 struct bch_extent_reconcile {
 #if defined(__LITTLE_ENDIAN_BITFIELD)
 	__u64	type:8,
-		unused:2,
+		unused:1,
+		dedup_pending:1,
 		ptrs_moving:5,
 		hipri:1,
 		pending:1,
@@ -128,7 +129,8 @@ struct bch_extent_reconcile {
 		pending:1,
 		hipri:1,
 		ptrs_moving:5,
-		unused:2,
+		dedup_pending:1,
+		unused:1,
 		type:8;
 #endif
 };
@@ -166,7 +168,8 @@ enum bch_reconcile_opts {
 	x(target,		4)		\
 	x(high_priority,	5)		\
 	x(pending,		6)		\
-	x(stripes,		7)
+	x(stripes,		7)		\
+	x(dedup,		8)
 
 enum bch_reconcile_accounting_type {
 #define x(t, n) BCH_RECONCILE_ACCOUNTING_##t = n,

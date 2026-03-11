@@ -10,6 +10,7 @@
 #include "btree/bkey_methods.h"
 #include "btree/cache.h"
 
+#include "data/dedup.h"
 #include "data/ec/create.h"
 #include "data/ec/trigger.h"
 #include "data/extents.h"

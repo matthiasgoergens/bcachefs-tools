@@ -119,6 +119,7 @@ bcachefs-y		:=			\
 	data/checksum.o				\
 	data/compress.o				\
 	data/copygc.o				\
+	data/dedup.o				\
 	data/ec/create.o			\
 	data/ec/init.o				\
 	data/ec/io.o				\

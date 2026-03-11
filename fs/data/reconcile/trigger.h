@@ -35,7 +35,7 @@ static inline struct bbpos rb_work_to_data_pos(struct bpos pos)
 
 static inline enum reconcile_work_id rb_work_id(const struct bch_extent_reconcile *r)
 {
-	if (!r || !r->need_rb)
+	if (!r || (!r->need_rb && !r->dedup_pending))
 		return RECONCILE_WORK_none;
 	if (r->pending)
 		return RECONCILE_WORK_pending;
@@ -109,7 +109,7 @@ int __bch2_trigger_extent_reconcile(struct btree_trans *,
 
 static inline unsigned rb_needs_trigger(const struct bch_extent_reconcile *r)
 {
-	return r ? r->need_rb|r->ptrs_moving : 0;
+	return r ? r->need_rb|r->ptrs_moving|r->dedup_pending : 0;
 }
 
 static inline int bch2_trigger_extent_reconcile(struct btree_trans *trans,
