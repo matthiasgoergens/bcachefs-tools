@@ -520,6 +520,14 @@ enum fsck_err_opts {
 	  NULL,		"Nocow mode: Writes will be done in place when possible.\n"\
 			"Snapshots and reflink will still cause writes to be COW\n"\
 			"Implicitly disables data checksumming, compression and encryption")\
+	x(nojournal,			u8,				\
+	  OPT_INODE|OPT_RUNTIME,					\
+	  OPT_BOOL(),							\
+	  BCH2_NO_SB_OPT,		false,				\
+	  NULL,		"Skip journaling extent updates for this inode.\n"\
+		"Data writes are still COW, but btree metadata updates\n"\
+		"are not journaled. On crash, fsck reconciles stale extents.\n"\
+		"Set automatically for swap files.")\
 	x(nocow_enabled,		u8,				\
 	  OPT_FS|OPT_MOUNT|OPT_NODOC,					\
 	  OPT_BOOL(),							\

@@ -971,12 +971,18 @@ static inline int bch2_extent_update_i_size_sectors(struct btree_trans *trans,
 	 * updating bi_size or bi_sectors), then we don't need the inode update
 	 * to be journalled - if we crash, the bi_journal_seq update will be
 	 * lost, but that's fine.
+	 *
+	 * If the inode has bi_nojournal set, we always skip journaling the
+	 * inode update regardless of size/sectors/snapshot changes.  On crash,
+	 * fsck reconciles any stale metadata.  This is used for swap files
+	 * and other ephemeral data.
 	 */
 	unsigned inode_update_flags = BTREE_UPDATE_nojournal;
 
 	if (new_i_size > le64_to_cpu(inode->v.bi_size)) {
 		inode->v.bi_size = cpu_to_le64(new_i_size);
-		inode_update_flags = 0;
+		if (!opts->nojournal)
+			inode_update_flags = 0;
 	}
 
 	if (i_sectors_delta) {
@@ -985,7 +991,8 @@ static inline int bch2_extent_update_i_size_sectors(struct btree_trans *trans,
 			bi_sectors_underflow(trans, inode, &i_sectors_delta);
 
 		le64_add_cpu(&inode->v.bi_sectors, i_sectors_delta);
-		inode_update_flags = 0;
+		if (!opts->nojournal)
+			inode_update_flags = 0;
 	}
 
 	/*
@@ -996,7 +1003,8 @@ static inline int bch2_extent_update_i_size_sectors(struct btree_trans *trans,
 	 */
 	if (inode->k.p.snapshot != iter.snapshot) {
 		inode->k.p.snapshot = iter.snapshot;
-		inode_update_flags = 0;
+		if (!opts->nojournal)
+			inode_update_flags = 0;
 	}
 
 	return bch2_trans_update(trans, &iter, &inode->k_i,
@@ -1054,15 +1062,20 @@ int bch2_extent_update(struct btree_trans *trans,
 					      min(k->k.p.offset << 9, new_i_size),
 					      i_sectors_delta, &opts));
 
+	unsigned nojournal_flags = opts.nojournal
+		? BCH_TRANS_COMMIT_no_journal_res : 0;
+
 	try(bch2_bkey_set_needs_reconcile(trans, NULL, &opts, bkey_i_to_s(k), k_buf_u64s,
 					  SET_NEEDS_RECONCILE_foreground,
 					  change_cookie));
 	try(bch2_trans_update(trans, iter, k,
-			      BTREE_TRIGGER_set_needs_reconcile_done));
+			      BTREE_TRIGGER_set_needs_reconcile_done|
+			      (opts.nojournal ? BTREE_UPDATE_nojournal : 0)));
 
 	try(bch2_trans_commit_flush(trans, disk_res, NULL, flush,
 				    BCH_TRANS_COMMIT_no_check_rw|
-				    BCH_TRANS_COMMIT_no_enospc));
+				    BCH_TRANS_COMMIT_no_enospc|
+				    nojournal_flags));
 
 	if (i_sectors_delta_total)
 		*i_sectors_delta_total += i_sectors_delta;
