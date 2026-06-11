@@ -2457,6 +2457,48 @@ static int bch2_sync_fs(struct super_block *sb, int wait)
 	return bch2_err_class(ret);
 }
 
+/*
+ * Ordered journal flush (journal_flush_ordered, "desktop mode"): make every
+ * periodic journal flush entry self-contained.
+ *
+ * Sync dirty pagecache first — writeback completion runs after the extent
+ * update is committed (bch2_writepage_io_done() is the write op's end_io),
+ * so when sync_inodes_sb() returns, every extent for data written before the
+ * sync started is inserted and journal-pinned.  Then flush the journal:
+ * recovery replaying up to this flush entry lands on a point-in-time prefix
+ * of history — no zero-byte files from journaled metadata whose data never
+ * made it to disk.
+ *
+ * This pairs with journal_flush_disabled=1: fsync may lie about durability
+ * (nothing local needs durability, only consistency), while the periodic
+ * flush boundary stays a consistent snapshot.
+ *
+ * Known gap (v1): metadata committed between sync_inodes_sb() returning and
+ * the flush entry being written can reference still-dirty data.  The window
+ * is the journal flush latency rather than the full flush_delay, but closing
+ * it entirely needs a commit gate at flush time.
+ */
+static void bch2_ordered_flush_work_fn(struct work_struct *work)
+{
+	struct bch_fs *c = container_of(work, struct bch_fs,
+					ordered_flush_work.work);
+	struct super_block *sb = c->vfs_sb;
+
+	if (c->opts.journal_flush_ordered &&
+	    test_bit(BCH_FS_rw, &c->flags) &&
+	    !bch2_journal_error(&c->journal) &&
+	    down_read_trylock(&sb->s_umount)) {
+		if (sb->s_flags & SB_ACTIVE) {
+			sync_inodes_sb(sb);
+			bch2_journal_flush(&c->journal);
+		}
+		up_read(&sb->s_umount);
+	}
+
+	queue_delayed_work(system_unbound_wq, &c->ordered_flush_work,
+			   msecs_to_jiffies(c->opts.journal_flush_delay ?: 1000));
+}
+
 static struct bch_fs *bch2_path_to_fs(const char *path)
 {
 	struct bch_fs *c;
@@ -2506,6 +2548,12 @@ static int bch2_show_options(struct seq_file *seq, struct dentry *root)
 static void bch2_put_super(struct super_block *sb)
 {
 	struct bch_fs *c = sb->s_fs_info;
+
+	/*
+	 * disable, not cancel: the work re-arms itself, disabling makes the
+	 * re-queue a no-op.  Re-mounting re-inits the work, clearing this.
+	 */
+	disable_delayed_work_sync(&c->ordered_flush_work);
 
 	bch2_fs_stop(c);
 }
@@ -2744,6 +2792,10 @@ got_sb:
 #endif
 
 	sb->s_flags |= SB_ACTIVE;
+
+	INIT_DELAYED_WORK(&c->ordered_flush_work, bch2_ordered_flush_work_fn);
+	queue_delayed_work(system_unbound_wq, &c->ordered_flush_work,
+			   msecs_to_jiffies(c->opts.journal_flush_delay ?: 1000));
 out:
 	fc->root = dget(sb->s_root);
 err:

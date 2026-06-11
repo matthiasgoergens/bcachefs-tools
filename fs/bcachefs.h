@@ -704,6 +704,8 @@ struct bch_fs {
 	int			minor;
 	struct device		*chardev;
 	struct super_block	*vfs_sb;
+	/* ordered journal flush (journal_flush_ordered): */
+	struct delayed_work	ordered_flush_work;
 	dev_t			dev;
 	char			name[40];
 

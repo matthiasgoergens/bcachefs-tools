@@ -353,6 +353,14 @@ enum fsck_err_opts {
 	  OPT_UINT(0, U32_MAX),						\
 	  BCH_SB_JOURNAL_RECLAIM_DELAY,	100,				\
 	  NULL,		"Delay in milliseconds before automatic journal reclaim")\
+	x(journal_flush_ordered,	u8,				\
+	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
+	  OPT_BOOL(),							\
+	  BCH2_NO_SB_OPT,		false,				\
+	  NULL,		"Sync dirty data before each periodic journal flush\n"\
+		"so every flush entry is self-contained: recovery never\n"\
+		"sees metadata whose data didn't make it to disk.\n"\
+		"Pairs with journal_flush_disabled (desktop mode).")\
 	x(writeback_timeout,		u16,				\
 	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
 	  OPT_UINT(0, U16_MAX),						\
