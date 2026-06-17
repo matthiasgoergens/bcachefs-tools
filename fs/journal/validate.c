@@ -619,6 +619,35 @@ static __cold void journal_entry_rewind_to_text(struct printbuf *out, struct bch
 	prt_printf(out, "from %llu to %llu", le64_to_cpu(r->from), le64_to_cpu(r->to));
 }
 
+static int journal_entry_data_epoch_validate(struct bch_fs *c,
+				struct jset *jset,
+				struct jset_entry *entry,
+				unsigned version, int big_endian,
+				struct bkey_validate_context from)
+{
+	unsigned bytes = jset_u64s(le16_to_cpu(entry->u64s)) * sizeof(u64);
+	int ret = 0;
+
+	if (journal_entry_err_on(bytes < sizeof(struct jset_entry_data_epoch),
+				 c, version, jset, entry,
+				 journal_entry_data_epoch_bad_size,
+				 "bad size (got %u, expected >= %zu)",
+				 bytes, sizeof(struct jset_entry_data_epoch))) {
+		journal_entry_null_range(entry, vstruct_next(entry));
+	}
+fsck_err:
+	return ret;
+}
+
+static void journal_entry_data_epoch_to_text(struct printbuf *out, struct bch_fs *c,
+					     struct jset_entry *entry)
+{
+	struct jset_entry_data_epoch *e =
+		container_of(entry, struct jset_entry_data_epoch, entry);
+
+	prt_printf(out, "epoch %llu", le64_to_cpu(e->epoch));
+}
+
 struct jset_entry_ops {
 	int (*validate)(struct bch_fs *, struct jset *,
 			struct jset_entry *, unsigned, int,

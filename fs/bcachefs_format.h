@@ -1079,7 +1079,10 @@ LE64_BITMASK(BCH_SB_EXT_BTREE_CACHE_SHRINKER_SEEKS,
 	  "discard eligibility checks",				"2026-03")	\
 	x(per_dev_fragmentation_lru,	BCH_VERSION(1, 39),			\
 	  "Per-device bucket fragmentation LRUs, so copygc can reason "		\
-	  "about fragmentation per device",			"2026-07")
+	  "about fragmentation per device",			"2026-07")	\
+	x(journal_data_epoch,		BCH_VERSION(1, 40),			\
+	  "Desktop-mode ordered flush: per-commit data epoch tag "		\
+	  "for crash-consistent rewind boundaries",		"2026-06")
 
 enum bcachefs_metadata_version {
 	bcachefs_metadata_version_min = 9,
@@ -1604,7 +1607,10 @@ static inline __u64 __bset_magic(struct bch_sb *sb)
 	  "(discards may have invalidated earlier seqs)")	\
 	x(rewind,		15,				\
 	  "Rewind in progress: keys from entries in this "	\
-	  "seq range use overwrite entries")
+	  "seq range use overwrite entries")			\
+	x(data_epoch,		16,				\
+	  "Desktop-mode data epoch marker: subsequent keys "	\
+	  "in this entry belong to the given data epoch")
 
 enum bch_jset_entry_type {
 #define x(f, nr, ...)	BCH_JSET_ENTRY_##f	= nr,
@@ -1731,6 +1737,17 @@ struct jset_entry_rewind {
 	struct jset_entry	entry;
 	__le64			from;
 	__le64			to;
+} __packed __aligned(8);
+
+/*
+ * Desktop-mode (journal_flush_ordered) data epoch marker: every key following
+ * this entry within the same journal entry belongs to data epoch @epoch, until
+ * the next marker. Recovery uses the epoch to choose a crash-consistent rewind
+ * boundary, dropping keys whose epoch is newer than the boundary.
+ */
+struct jset_entry_data_epoch {
+	struct jset_entry	entry;
+	__le64			epoch;
 } __packed __aligned(8);
 
 /*

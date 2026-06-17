@@ -2489,6 +2489,19 @@ static void bch2_ordered_flush_work_fn(struct work_struct *work)
 	    !bch2_journal_error(&c->journal) &&
 	    down_read_trylock(&sb->s_umount)) {
 		if (sb->s_flags & SB_ACTIVE) {
+			/*
+			 * Two-pass sync (v1.5): the race window between the data
+			 * sync and the flush seal is D_sync + D_seal.  Pass 1
+			 * writes back the bulk of dirty data; pass 2 catches
+			 * what was dirtied *during* pass 1 — a much smaller set,
+			 * so D_sync for the seal-relevant window shrinks toward
+			 * zero.  Cannot reduce consistency below the single-pass
+			 * version (worst case: identical, just more sync work);
+			 * a clean fs makes pass 2 a cheap walk of clean inodes.
+			 * The residual tail (a create whose write() lands after
+			 * pass 2, before the seal) needs the epoch barrier (v2).
+			 */
+			sync_inodes_sb(sb);
 			sync_inodes_sb(sb);
 			bch2_journal_flush(&c->journal);
 		}

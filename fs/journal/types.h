@@ -344,6 +344,16 @@ struct journal {
 	u64			rewind_seq_ondisk;
 
 	/*
+	 * Desktop mode (journal_flush_ordered) data epoch: bumped by the ordered
+	 * flush worker before each sync+flush cycle. Dangerous metadata commits
+	 * read it at commit time; extent inserts carry the epoch in which their
+	 * data was dirtied. Recovery uses epoch boundaries to pick a crash-
+	 * consistent rewind target, dropping keys whose epoch is newer than the
+	 * boundary.
+	 */
+	atomic64_t		data_epoch;
+
+	/*
 	 * Rewind ranges: keys from journal entries with seq
 	 * in (to, from] use overwrite entries instead of
 	 * btree_keys entries.
