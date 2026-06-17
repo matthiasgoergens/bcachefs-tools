@@ -305,32 +305,21 @@ int bch2_dedup_extent(struct moving_context *ctxt,
 		return 0;
 
 	struct bch_extent_crc_unpacked crc;
-	if (!extent_get_crc(c, k, &crc)) {
-		pr_err("dedup: extent_get_crc false!\n");
+	if (!extent_get_crc(c, k, &crc))
 		return 0;
-	}
 
 	/* Skip compressed extents — their checksums cover compressed data */
-	if (crc_is_compressed(crc)) {
-		pr_err("dedup: crc_is_compressed true!\n");
+	if (crc_is_compressed(crc))
 		return 0;
-	}
 
 	struct bpos dedup_pos = dedup_pos_from_crc(crc);
-	pr_err("dedup: ino=%llu off=%llu sz=%u csum=%llx:%llx\n",
-	       k.k->p.inode, k.k->p.offset,
-	       k.k->size,
-	       crc.csum.hi, crc.csum.lo);
 
 	/* Look up this checksum in the dedup index */
 	CLASS(btree_iter, dedup_iter)(trans, BTREE_ID_dedup, dedup_pos,
 				     BTREE_ITER_intent);
 	struct bkey_s_c dedup_k = bch2_btree_iter_peek_slot(&dedup_iter);
-	if (bkey_err(dedup_k)) {
-		pr_err("dedup: peek_slot error=%d\n", bkey_err(dedup_k));
+	if (bkey_err(dedup_k))
 		return bkey_err(dedup_k);
-	}
-	pr_err("dedup: peek_slot ok type=%d\n", dedup_k.k->type);
 
 	if (dedup_k.k->type != KEY_TYPE_dedup) {
 		/*
@@ -338,20 +327,17 @@ int bch2_dedup_extent(struct moving_context *ctxt,
 		 * seen with this checksum.  Record it in the index.
 		 */
 		int ret;
-		
+
 		ret = dedup_index_insert(trans, &dedup_iter, k, k.k->size);
-		pr_err("dedup: index_insert ret=%d\n", ret);
 		if (ret)
 			return ret;
-		
+
 		ret = dedup_clear_pending(trans, extent_iter, k);
-		pr_err("dedup: clear_pending ret=%d\n", ret);
 		if (ret)
 			return ret;
 
 		ret = bch2_trans_commit(trans, NULL, NULL,
 					BCH_TRANS_COMMIT_no_enospc);
-		pr_err("dedup: trans_commit ret=%d\n", ret);
 		if (!ret)
 			this_cpu_inc(c->counters.now[BCH_COUNTER_dedup_extent_indexed]);
 		return ret;
@@ -365,19 +351,13 @@ int bch2_dedup_extent(struct moving_context *ctxt,
 		(const struct bch_dedup *) dedup_k.v;
 
 	/* Quick reject: size mismatch means different content */
-	if (le32_to_cpu(d->size_sectors) != k.k->size) {
-		pr_err("dedup: size mismatch d=%u k=%u\n", le32_to_cpu(d->size_sectors), k.k->size);
+	if (le32_to_cpu(d->size_sectors) != k.k->size)
 		return 0;
-	}
 
 	/* Don't dedup an extent with itself */
 	if (le64_to_cpu(d->src_inode)  == k.k->p.inode &&
-	    le64_to_cpu(d->src_offset) == k.k->p.offset) {
-		pr_err("dedup: self-dedup skip inode=%llu offset=%llu\n",
-		       k.k->p.inode, k.k->p.offset);
+	    le64_to_cpu(d->src_offset) == k.k->p.offset)
 		return 0;
-	}
-	pr_err("dedup: found match, proceeding to verify\n");
 
 	/*
 	 * Look up the source extent to verify it still exists and
@@ -441,30 +421,38 @@ int bch2_dedup_extent(struct moving_context *ctxt,
 	struct bio *bio_src = NULL, *bio_dst = NULL;
 	int ret;
 
-	pr_err("dedup: reading src extent\n");
 	ret = dedup_read_extent(trans, bkey_i_to_s_c(src_saved.k), &bio_src);
-	if (ret) {
-		pr_err("dedup: reading src extent failed ret=%d\n", ret);
-		return ret;
-	}
+	if (!ret)
+		ret = dedup_read_extent(trans, bkey_i_to_s_c(dst_saved.k), &bio_dst);
 
-	pr_err("dedup: reading dst extent\n");
-	ret = dedup_read_extent(trans, bkey_i_to_s_c(dst_saved.k), &bio_dst);
-	if (ret) {
-		pr_err("dedup: reading dst extent failed ret=%d\n", ret);
+	bool match = false;
+	if (!ret)
+		match = bio_data_equal(bio_src, bio_dst);
+
+	if (bio_src)
 		bio_free_and_put(bio_src);
+	if (bio_dst)
+		bio_free_and_put(bio_dst);
+
+	/*
+	 * Re-acquire btree locks before touching the transaction again.
+	 * bch2_trans_unlock_long() above left the transaction unlocked for the
+	 * blocking reads; every path from here on (skip, error return, and the
+	 * commit_do below) accesses the btree, so we must relock first.  If the
+	 * relock fails we return the restart error so the caller's
+	 * lockrestart loop retries cleanly -- returning 0/ret with an unlocked
+	 * transaction makes the caller panic in
+	 * bch2_trans_unlocked_or_in_restart_error() ("trans should be locked").
+	 */
+	int relock_ret = bch2_trans_relock(trans);
+	if (relock_ret)
+		return relock_ret;
+
+	if (ret)
 		return ret;
-	}
-
-	pr_err("dedup: byte-comparing extents\n");
-	bool match = bio_data_equal(bio_src, bio_dst);
-
-	bio_free_and_put(bio_src);
-	bio_free_and_put(bio_dst);
 
 	if (!match) {
-		pr_err("dedup: byte-verify mismatch! CRC collision!\n");
-		/* Checksum collision — skip silently */
+		/* Checksum collision — checksums matched but data differs; skip. */
 		this_cpu_inc(c->counters.now[BCH_COUNTER_dedup_byte_verify_mismatch]);
 		return 0;
 	}
@@ -476,51 +464,37 @@ int bch2_dedup_extent(struct moving_context *ctxt,
 	int dedup_ret = commit_do(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc, ({
 		int _ret = 0;
 
-
 		struct bkey_s_c cur_src = bch2_btree_iter_peek_slot(&src_iter);
 		if (bkey_err(cur_src)) {
-			pr_info("bch2_dedup_extent() dedup: cur_src bkey_err %d\n", bkey_err(cur_src));
 			_ret = bkey_err(cur_src);
 			goto out;
 		}
 
 		struct bkey_s_c cur_dst = bch2_btree_iter_peek_slot(extent_iter);
 		if (bkey_err(cur_dst)) {
-			pr_info("bch2_dedup_extent() dedup: cur_dst bkey_err %d\n", bkey_err(cur_dst));
 			_ret = bkey_err(cur_dst);
 			goto out;
 		}
 
-		if (!cur_src.k || !cur_dst.k) {
-			pr_info("bch2_dedup_extent() dedup: verify iterators NULL\n");
+		/* Data changed under us while unlocked for I/O — skip silently. */
+		if (!cur_src.k || !cur_dst.k)
 			goto out;
-		}
 
 		if (!bpos_eq(cur_src.k->p, src_saved.k->k.p) ||
 		    cur_src.k->size != src_saved.k->k.size ||
 		    cur_src.k->bversion.lo != src_saved.k->k.bversion.lo ||
-		    cur_src.k->bversion.hi != src_saved.k->k.bversion.hi) {
-			pr_info("bch2_dedup_extent() dedup: source changed pos %llu-%llu, size %llu vs %llu\n",
-				(u64)cur_src.k->p.offset, (u64)src_saved.k->k.p.offset,
-				(u64)cur_src.k->size, (u64)src_saved.k->k.size);
+		    cur_src.k->bversion.hi != src_saved.k->k.bversion.hi)
 			goto out;
-		}
 
 		if (!bpos_eq(cur_dst.k->p, dst_saved.k->k.p) ||
 		    cur_dst.k->size != dst_saved.k->k.size ||
 		    cur_dst.k->bversion.lo != dst_saved.k->k.bversion.lo ||
-		    cur_dst.k->bversion.hi != dst_saved.k->k.bversion.hi) {
-			pr_info("bch2_dedup_extent() dedup: dest changed pos %llu-%llu, size %llu vs %llu\n",
-				(u64)cur_dst.k->p.offset, (u64)dst_saved.k->k.p.offset,
-				(u64)cur_dst.k->size, (u64)dst_saved.k->k.size);
+		    cur_dst.k->bversion.hi != dst_saved.k->k.bversion.hi)
 			goto out;
-		}
 
 		if (!bkey_extent_is_direct_data(cur_src.k) ||
-		    !bkey_extent_is_direct_data(cur_dst.k)) {
-			pr_info("bch2_dedup_extent() dedup: not direct data anymore\n");
+		    !bkey_extent_is_direct_data(cur_dst.k))
 			goto out;
-		}
 
 		/* Step 1: Make the source extent indirect (creates reflink_v) */
 		struct bkey_buf src_indirect_buf __cleanup(bch2_bkey_buf_exit);
@@ -528,10 +502,8 @@ int bch2_dedup_extent(struct moving_context *ctxt,
 		bch2_bkey_buf_reassemble(&src_indirect_buf, cur_src);
 
 		_ret = bch2_make_extent_indirect(trans, &src_iter, src_indirect_buf.k, false);
-		if (_ret) {
-			pr_info("bch2_dedup_extent() dedup: make_extent_indirect ret=%d\n", _ret);
+		if (_ret)
 			goto out;
-		}
 		BUG_ON(src_indirect_buf.k->k.type != KEY_TYPE_reflink_p);
 
 		/* Step 2: Create a reflink_p for the destination extent */
@@ -555,10 +527,8 @@ int bch2_dedup_extent(struct moving_context *ctxt,
 
 		_ret = bch2_trans_update(trans, extent_iter, &dst_p->k_i,
 				      BTREE_UPDATE_internal_snapshot_node);
-		if (_ret) {
-			pr_info("bch2_dedup_extent() dedup: trans_update ret=%d\n", _ret);
+		if (_ret)
 			goto out;
-		}
 
 		/* Step 3: Update dedup index to record the reflink_v */
 		_ret = dedup_index_update_reflink(trans, &dedup_iter, dedup_k, reflink_idx);
