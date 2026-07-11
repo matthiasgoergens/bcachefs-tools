@@ -116,6 +116,38 @@ static inline void bio_advance_iter(struct bio *bio, struct bvec_iter *iter,
 		bvec_iter_advance(bio->bi_io_vec, iter, bytes);
 }
 
+static inline void bio_advance_iter_single(const struct bio *bio,
+					   struct bvec_iter *iter,
+					   unsigned bytes)
+{
+	bio_advance_iter((struct bio *) bio, iter, bytes);
+}
+
+static inline void __bio_add_page(struct bio *bio, struct page *page,
+				  unsigned len, unsigned off)
+{
+	struct bio_vec *bv = &bio->bi_io_vec[bio->bi_vcnt];
+
+	bv->bv_addr	= page_address(page) + off;
+	bv->bv_len	= len;
+
+	bio->bi_iter.bi_size += len;
+	bio->bi_vcnt++;
+}
+
+/*
+ * Only valid when every segment was added with __bio_add_page(page, len, 0):
+ * bv_addr is then the start of the allocation __free_page expects.
+ */
+static inline void bio_free_pages(struct bio *bio)
+{
+	struct bio_vec *bvec;
+	struct bvec_iter_all iter;
+
+	bio_for_each_segment_all(bvec, bio, iter)
+		__free_page(bvec->bv_addr);
+}
+
 #define __bio_for_each_segment(bvl, bio, iter, start)			\
 	for (iter = (start);						\
 	     (iter).bi_size &&						\
