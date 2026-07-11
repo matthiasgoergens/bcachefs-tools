@@ -236,6 +236,13 @@ enum fsck_err_opts {
 	  OPT_BOOL(),							\
 	  BCH_SB_BACKGROUND_DEDUP,	false,				\
 	  NULL,		"Enable background deduplication")	\
+	x(dedup_force_byte_verify_mismatch, u8,				\
+	  OPT_FS|OPT_MOUNT|OPT_RUNTIME|OPT_NODOC,			\
+	  OPT_BOOL(),							\
+	  BCH2_NO_SB_OPT,		false,				\
+	  NULL,		"Debug: treat every dedup byte-verify as a mismatch\n"\
+		"(as if a checksum collision occurred), to exercise the\n"\
+		"collision-skip path deterministically in tests")	\
 	x(casefold,			u8,				\
 	  OPT_FS|OPT_INODE|OPT_FORMAT,					\
 	  OPT_BOOL(),							\

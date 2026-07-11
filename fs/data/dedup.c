@@ -429,6 +429,15 @@ int bch2_dedup_extent(struct moving_context *ctxt,
 	if (!ret)
 		match = bio_data_equal(bio_src, bio_dst);
 
+	/*
+	 * Debug knob: pretend the byte-verify failed, as if the checksums
+	 * collided on differing data.  Lets tests exercise the mismatch
+	 * path (which once returned with the transaction unlocked and
+	 * panicked the caller) without needing a real CRC collision.
+	 */
+	if (unlikely(c->opts.dedup_force_byte_verify_mismatch))
+		match = false;
+
 	if (bio_src)
 		bio_free_and_put(bio_src);
 	if (bio_dst)
