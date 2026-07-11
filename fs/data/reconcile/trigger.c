@@ -834,12 +834,32 @@ int bch2_bkey_set_needs_reconcile(struct btree_trans *trans,
 	struct bch_extent_reconcile new;
 
 	int ret = bch2_bkey_needs_reconcile(trans, k.s_c, opts, &need_update_invalid_devs, &new);
-	if (ret <= 0)
+	if (ret < 0)
 		return ret;
+
+	/*
+	 * Dedup: mark dedup_pending on foreground writes only, not on
+	 * reconcile-triggered updates of existing extents.  This must be
+	 * able to create the reconcile entry on its own: on a filesystem
+	 * with no background targets/compression, need_rb is never set, so
+	 * without this an extent would never get an entry to carry the flag
+	 * (and bch2_bkey_needs_reconcile() returns 0 above).
+	 */
+	bool dedup_mark = ctx == SET_NEEDS_RECONCILE_foreground &&
+		opts->background_dedup &&
+		opts->data_checksum &&
+		k.k->type != KEY_TYPE_reflink_p &&
+		k.k->type != KEY_TYPE_stripe;
+
+	if (!ret && !dedup_mark)
+		return 0;
 
 	if (k.k->type == KEY_TYPE_stripe)
 		return set_needs_reconcile_stripe(trans, snapshot_io_opts, k,
 						  new.need_rb & BIT(BCH_RECONCILE_data_replicas));
+
+	if (dedup_mark)
+		new.dedup_pending = 1;
 
 	struct bch_extent_reconcile *old =
 		(struct bch_extent_reconcile *) bch2_bkey_reconcile_opts(c, k.s_c);
@@ -857,16 +877,6 @@ int bch2_bkey_set_needs_reconcile(struct btree_trans *trans,
 		}
 
 		*old = new;
-
-		/*
-		 * Dedup: only set dedup_pending on foreground writes,
-		 * not on reconcile-triggered updates of existing extents.
-		 */
-		if (ctx == SET_NEEDS_RECONCILE_foreground &&
-		    opts->background_dedup &&
-		    k.k->type != KEY_TYPE_reflink_p &&
-		    opts->data_checksum)
-			old->dedup_pending = 1;
 	} else if (old)
 		extent_entry_drop(c, k, (union bch_extent_entry *) old);
 
