@@ -212,7 +212,15 @@ static int dedup_index_insert(struct btree_trans *trans,
 	struct bch_dedup *d = &new->v;
 	memset(d, 0, sizeof(*d));
 	d->src_inode	= cpu_to_le64(k.k->p.inode);
-	d->src_offset	= cpu_to_le64(k.k->p.offset);
+	/*
+	 * Store the extent's START offset: the source lookup is a slot
+	 * peek, which returns the extent containing the position — the
+	 * end offset (k.k->p.offset) is one past the extent, so storing
+	 * it made every source lookup land on the next extent or a hole
+	 * ("gone" -> spurious stale path; dedup could only ever succeed
+	 * by accident against an identical adjacent extent).
+	 */
+	d->src_offset	= cpu_to_le64(bkey_start_offset(k.k));
 	d->src_snapshot	= cpu_to_le32(k.k->p.snapshot);
 	d->size_sectors	= cpu_to_le32(size_sectors);
 
@@ -354,9 +362,9 @@ int bch2_dedup_extent(struct moving_context *ctxt,
 	if (le32_to_cpu(d->size_sectors) != k.k->size)
 		return 0;
 
-	/* Don't dedup an extent with itself */
+	/* Don't dedup an extent with itself (src_offset is the START offset) */
 	if (le64_to_cpu(d->src_inode)  == k.k->p.inode &&
-	    le64_to_cpu(d->src_offset) == k.k->p.offset)
+	    le64_to_cpu(d->src_offset) == bkey_start_offset(k.k))
 		return 0;
 
 	/*
