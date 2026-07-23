@@ -194,6 +194,45 @@ static int dedup_clear_pending(struct btree_trans *trans,
 }
 
 /*
+ * Terminal skip: this extent cannot be deduplicated and never will be by a
+ * later reconcile pass — its checksum collides with a different-sized or
+ * different-data extent, it is its own index source, or its content is
+ * unsupported for dedup (e.g. compressed).  Clear dedup_pending and commit so
+ * reconcile stops reprocessing it.
+ *
+ * This is a liveness requirement, not an optimisation: dedup keys the index on
+ * the (non-cryptographic) data checksum alone, so an unprivileged writer can
+ * craft extents that collide with an existing entry on checksum but differ on
+ * size or bytes.  Left pending, every reconcile pass re-attempts the same
+ * doomed dedup, churning the btree forever — a fs-wide journal freeze and read
+ * livelock (local DoS).  Clearing pending makes the outcome "attempted, do not
+ * retry."
+ *
+ * Distinct from the transient "data changed under us while unlocked" cases
+ * (inside the commit_do below), which deliberately keep dedup_pending set and
+ * retry once the race clears.  Re-peek so we act on the current key and never
+ * clear pending on an extent that has since been converted or removed.
+ */
+static int dedup_skip_terminal(struct btree_trans *trans,
+			       struct btree_iter *extent_iter)
+{
+	struct bkey_s_c k = bch2_btree_iter_peek_slot(extent_iter);
+	int ret = bkey_err(k);
+	if (ret)
+		return ret;
+
+	/* Already converted (reflink_p) or gone — nothing left to clear. */
+	if (!bkey_extent_is_direct_data(k.k))
+		return 0;
+
+	ret = dedup_clear_pending(trans, extent_iter, k);
+	if (ret)
+		return ret;
+
+	return bch2_trans_commit(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc);
+}
+
+/*
  * Insert a new dedup index entry recording this extent as the first
  * seen with this checksum.
  */
@@ -314,11 +353,11 @@ int bch2_dedup_extent(struct moving_context *ctxt,
 
 	struct bch_extent_crc_unpacked crc;
 	if (!extent_get_crc(c, k, &crc))
-		return 0;
+		return dedup_skip_terminal(trans, extent_iter);
 
 	/* Skip compressed extents — their checksums cover compressed data */
 	if (crc_is_compressed(crc))
-		return 0;
+		return dedup_skip_terminal(trans, extent_iter);
 
 	struct bpos dedup_pos = dedup_pos_from_crc(crc);
 
@@ -360,12 +399,12 @@ int bch2_dedup_extent(struct moving_context *ctxt,
 
 	/* Quick reject: size mismatch means different content */
 	if (le32_to_cpu(d->size_sectors) != k.k->size)
-		return 0;
+		return dedup_skip_terminal(trans, extent_iter);
 
 	/* Don't dedup an extent with itself (src_offset is the START offset) */
 	if (le64_to_cpu(d->src_inode)  == k.k->p.inode &&
 	    le64_to_cpu(d->src_offset) == bkey_start_offset(k.k))
-		return 0;
+		return dedup_skip_terminal(trans, extent_iter);
 
 	/*
 	 * Look up the source extent to verify it still exists and
@@ -394,7 +433,7 @@ int bch2_dedup_extent(struct moving_context *ctxt,
 	if (src_crc.csum_type != crc.csum_type ||
 	    src_crc.csum.lo != crc.csum.lo ||
 	    src_crc.csum.hi != crc.csum.hi)
-		return 0;
+		return dedup_skip_terminal(trans, extent_iter);
 
 	/*
 	 * Save our current keys so we can verify they haven't changed
@@ -469,9 +508,15 @@ int bch2_dedup_extent(struct moving_context *ctxt,
 		return ret;
 
 	if (!match) {
-		/* Checksum collision — checksums matched but data differs; skip. */
+		/*
+		 * Checksum collision — checksums matched but data differs.
+		 * Terminal: these two extents can never dedup, so clear
+		 * dedup_pending instead of leaving it set (which would make
+		 * reconcile re-attempt the doomed dedup every pass forever —
+		 * the collision-driven livelock / local DoS).
+		 */
 		this_cpu_inc(c->counters.now[BCH_COUNTER_dedup_byte_verify_mismatch]);
-		return 0;
+		return dedup_skip_terminal(trans, extent_iter);
 	}
 
 	/*
