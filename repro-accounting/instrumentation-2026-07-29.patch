@@ -1,0 +1,77 @@
+diff --git a/fs/init/recovery.c b/fs/init/recovery.c
+index abe65d931..ed5500648 100644
+--- a/fs/init/recovery.c
++++ b/fs/init/recovery.c
+@@ -958,8 +958,18 @@ use_clean:
+ 		}
+ 	}
+ 
++	bch_err(c, "INSTR before run_recovery_passes_startup: sb.version=%u.%u version_upgrade_complete=%u.%u",
++		BCH_VERSION_MAJOR(c->sb.version), BCH_VERSION_MINOR(c->sb.version),
++		BCH_VERSION_MAJOR(c->sb.version_upgrade_complete),
++		BCH_VERSION_MINOR(c->sb.version_upgrade_complete));
++
+ 	try(bch2_run_recovery_passes_startup(c, 0));
+ 
++	bch_err(c, "INSTR after run_recovery_passes_startup: sb.version=%u.%u version_upgrade_complete=%u.%u",
++		BCH_VERSION_MAJOR(c->sb.version), BCH_VERSION_MINOR(c->sb.version),
++		BCH_VERSION_MAJOR(c->sb.version_upgrade_complete),
++		BCH_VERSION_MINOR(c->sb.version_upgrade_complete));
++
+ 	/*
+ 	 * Normally set by the appropriate recovery pass: when cleared, this
+ 	 * indicates we're in early recovery and btree updates should be done by
+@@ -1026,6 +1036,11 @@ use_clean:
+ 		bool write_sb = false;
+ 
+ 		if (BCH_SB_VERSION_UPGRADE_COMPLETE(c->disk_sb.sb) != le16_to_cpu(c->disk_sb.sb->version)) {
++			bch_err(c, "INSTR marking VERSION_UPGRADE_COMPLETE %u.%u -> %u.%u (after all passes)",
++				BCH_VERSION_MAJOR(BCH_SB_VERSION_UPGRADE_COMPLETE(c->disk_sb.sb)),
++				BCH_VERSION_MINOR(BCH_SB_VERSION_UPGRADE_COMPLETE(c->disk_sb.sb)),
++				BCH_VERSION_MAJOR(le16_to_cpu(c->disk_sb.sb->version)),
++				BCH_VERSION_MINOR(le16_to_cpu(c->disk_sb.sb->version)));
+ 			SET_BCH_SB_VERSION_UPGRADE_COMPLETE(c->disk_sb.sb, le16_to_cpu(c->disk_sb.sb->version));
+ 			write_sb = true;
+ 		}
+diff --git a/fs/snapshots/check_snapshots.c b/fs/snapshots/check_snapshots.c
+index 1ab47b745..0904ad790 100644
+--- a/fs/snapshots/check_snapshots.c
++++ b/fs/snapshots/check_snapshots.c
+@@ -553,6 +553,8 @@ static int snapshot_data_sectors(struct btree_trans *trans, u32 id, u64 *sectors
+ 	/* btree 0 (extents, the default) is the only one with external_sectors (counter 2) */
+ 	u64 v[3] = {};
+ 	try(bch2_accounting_btree_read(trans, disk_accounting_pos_to_bpos(&acc), v, ARRAY_SIZE(v)));
++	bch_err(trans->c, "INSTR snapshot_data_sectors id=%u raw v=[%llu,%llu,%llu] -> sectors=%llu",
++		id, v[0], v[1], v[2], v[2]);
+ 	*sectors = v[2];
+ 	return 0;
+ }
+diff --git a/fs/snapshots/delete.c b/fs/snapshots/delete.c
+index c004f724a..da1cdd95b 100644
+--- a/fs/snapshots/delete.c
++++ b/fs/snapshots/delete.c
+@@ -196,6 +196,13 @@ int bch2_snapshot_accounting_totals(struct btree_trans *trans, u32 id,
+ 	bool trust_keys = c->sb.version_upgrade_complete >=
+ 		bcachefs_metadata_version_per_dev_fragmentation_lru;
+ 
++	bch_err(c, "INSTR accounting_totals id=%u sb.version=%u.%u sb.version_upgrade_complete=%u.%u trust_keys=%u",
++		id,
++		BCH_VERSION_MAJOR(c->sb.version), BCH_VERSION_MINOR(c->sb.version),
++		BCH_VERSION_MAJOR(c->sb.version_upgrade_complete),
++		BCH_VERSION_MINOR(c->sb.version_upgrade_complete),
++		trust_keys);
++
+ 	*total_keys = *total_sectors = 0;
+ 
+ 	for (unsigned btree = 0; btree < BTREE_ID_NR; btree++) {
+@@ -222,6 +229,10 @@ int bch2_snapshot_accounting_totals(struct btree_trans *trans, u32 id,
+ 		u64 key_bytes	= trust_keys ? v[1] : 0;
+ 		u64 sectors	= v[2];
+ 
++		if (v[0] || v[1] || v[2])
++			bch_err(c, "INSTR accounting_totals id=%u btree=%u raw v=[%llu,%llu,%llu] -> nr_keys=%llu key_bytes=%llu sectors=%llu",
++				id, btree, v[0], v[1], v[2], nr_keys, key_bytes, sectors);
++
+ 		if (!nr_keys && !sectors)
+ 			continue;
+ 
