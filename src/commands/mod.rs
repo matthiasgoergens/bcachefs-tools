@@ -102,6 +102,7 @@ pub mod fusemount;
 pub mod image;
 pub mod key;
 pub mod kill_btree_node;
+pub mod perf_test;
 pub mod kvdb;
 pub mod journal_rewind_info;
 pub mod list;
@@ -253,6 +254,7 @@ pub const COMMAND_GROUPS: &[GroupDef] = &[
     GroupDef { heading: "Debug", commands: &[
         &dump::CMD_DUMP, &dump::CMD_UNDUMP, &list::CMD, &list_journal::CMD,
         &kvdb::CMD, &kill_btree_node::CMD, &data_read::CMD, &unpoison::CMD,
+        &perf_test::CMD,
     ]},
     GroupDef { heading: "Miscellaneous",            commands: &[&completions::CMD, &VERSION_CMD] },
 ];
