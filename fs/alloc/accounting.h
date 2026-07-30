@@ -159,6 +159,15 @@ int bch2_accounting_mem_insert(struct bch_fs *, struct bkey_s_c_accounting, enum
 int bch2_accounting_mem_insert_locked(struct bch_fs *, struct bkey_s_c_accounting, enum bch_accounting_mode);
 void bch2_accounting_mem_gc(struct bch_fs *);
 
+static inline struct accounting_mem_entry *
+accounting_mem_lookup(struct bch_accounting_mem *acc, struct bpos pos)
+{
+	unsigned idx = eytzinger0_find(acc->k.data, acc->k.nr, sizeof(acc->k.data[0]),
+				       accounting_pos_cmp, &pos);
+
+	return idx < acc->k.nr ? acc->k.data + idx : NULL;
+}
+
 int bch2_accounting_btree_read(struct btree_trans *, struct bpos, u64 *, unsigned);
 
 static inline bool bch2_accounting_is_mem(struct disk_accounting_pos *acc)
@@ -224,17 +233,14 @@ int bch2_accounting_mem_add_inlined(struct btree_trans *trans,
 		}
 	}
 
-	unsigned idx;
+	struct accounting_mem_entry *e;
 
-	while ((idx = eytzinger0_find(acc->k.data, acc->k.nr, sizeof(acc->k.data[0]),
-				      accounting_pos_cmp, &a.k->p)) >= acc->k.nr) {
+	while (!(e = accounting_mem_lookup(acc, a.k->p))) {
 		if (unlikely(write_locked))
 			try(bch2_accounting_mem_insert_locked(c, a, mode));
 		else
 			try(bch2_accounting_mem_insert(c, a, mode));
 	}
-
-	struct accounting_mem_entry *e = &acc->k.data[idx];
 
 	const unsigned nr = min_t(unsigned, bch2_accounting_counters(a.k), e->nr_counters);
 
@@ -246,15 +252,13 @@ int bch2_accounting_mem_add_inlined(struct btree_trans *trans,
 int bch2_accounting_mem_add(struct btree_trans *, struct bkey_s_c_accounting,
 			    enum bch_accounting_mode, bool);
 
-static inline void bch2_accounting_mem_read_counters(struct bch_accounting_mem *acc,
-						     unsigned idx, u64 *v, unsigned nr, bool gc)
+static inline void bch2_accounting_mem_read_counters(struct accounting_mem_entry *e,
+						     u64 *v, unsigned nr, bool gc)
 {
 	memset(v, 0, sizeof(*v) * nr);
 
-	if (unlikely(idx >= acc->k.nr))
+	if (unlikely(!e))
 		return;
-
-	struct accounting_mem_entry *e = &acc->k.data[idx];
 
 	nr = min_t(unsigned, nr, e->nr_counters);
 
@@ -281,10 +285,8 @@ static inline void bch2_accounting_mem_read_locked(struct bch_fs *c, struct bpos
 	}));
 
 	struct bch_accounting_mem *acc = &c->accounting;
-	unsigned idx = eytzinger0_find(acc->k.data, acc->k.nr, sizeof(acc->k.data[0]),
-				       accounting_pos_cmp, &p);
 
-	bch2_accounting_mem_read_counters(acc, idx, v, nr, false);
+	bch2_accounting_mem_read_counters(accounting_mem_lookup(acc, p), v, nr, false);
 }
 
 static inline void bch2_accounting_mem_read(struct bch_fs *c, struct bpos p,

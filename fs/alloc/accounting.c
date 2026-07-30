@@ -409,8 +409,7 @@ static int __bch2_accounting_mem_insert(struct bch_fs *c, struct bkey_s_c_accoun
 	struct bch_accounting_mem *acc = &c->accounting;
 
 	/* raced with another insert, already present: */
-	if (eytzinger0_find(acc->k.data, acc->k.nr, sizeof(acc->k.data[0]),
-			    accounting_pos_cmp, &a.k->p) < acc->k.nr)
+	if (accounting_mem_lookup(acc, a.k->p))
 		return 0;
 
 	struct disk_accounting_pos acc_k;
@@ -516,12 +515,10 @@ void __bch2_accounting_maybe_kill(struct bch_fs *c, struct bpos pos)
 
 		struct bch_accounting_mem *acc = &c->accounting;
 
-		unsigned idx = eytzinger0_find(acc->k.data, acc->k.nr, sizeof(acc->k.data[0]),
-					       accounting_pos_cmp, &pos);
-		if (idx >= acc->k.nr)
+		struct accounting_mem_entry *e = accounting_mem_lookup(acc, pos);
+		if (!e)
 			return;
 
-		struct accounting_mem_entry *e = acc->k.data + idx;
 		if (!accounting_mem_entry_is_zero(e))
 			return;
 
@@ -609,7 +606,7 @@ int bch2_fs_replicas_usage_read(struct bch_fs *c, darray_char *usage)
 			continue;
 
 		u64 sectors;
-		bch2_accounting_mem_read_counters(acc, i - acc->k.data, &sectors, 1, false);
+		bch2_accounting_mem_read_counters(i, &sectors, 1, false);
 		u.r.sectors = sectors;
 
 		try(darray_make_room(usage, replicas_usage_bytes(&u.r)));
@@ -643,8 +640,7 @@ int bch2_fs_accounting_read(struct bch_fs *c, darray_char *out_buf, unsigned acc
 			bkey_accounting_init((void *) &darray_top(*out_buf));
 		set_bkey_val_u64s(&a_out->k, i->nr_counters);
 		a_out->k.p = i->pos;
-		bch2_accounting_mem_read_counters(acc, i - acc->k.data,
-						  a_out->v.d, i->nr_counters, false);
+		bch2_accounting_mem_read_counters(i, a_out->v.d, i->nr_counters, false);
 
 		if (!bch2_accounting_key_is_zero(accounting_i_to_s_c(a_out)))
 			out_buf->nr += bkey_bytes(&a_out->k);
@@ -737,8 +733,8 @@ int bch2_gc_accounting_done(struct bch_fs *c)
 		u64 dst_v[BCH_ACCOUNTING_MAX_COUNTERS];
 
 		unsigned nr = e->nr_counters;
-		bch2_accounting_mem_read_counters(acc, idx, dst_v, nr, false);
-		bch2_accounting_mem_read_counters(acc, idx, src_v, nr, true);
+		bch2_accounting_mem_read_counters(e, dst_v, nr, false);
+		bch2_accounting_mem_read_counters(e, src_v, nr, true);
 
 		if (memcmp(dst_v, src_v, nr * sizeof(u64))) {
 			printbuf_reset(&buf);
@@ -1109,14 +1105,14 @@ static int accounting_read_mem_fixups(struct btree_trans *trans)
 	CLASS(bch_log_msg, underflow_err)(c);
 	underflow_err.m.suppress = true;
 
-	for (unsigned i = 0; i < acc->k.nr; i++) {
+	darray_for_each(acc->k, e) {
 		struct disk_accounting_pos k;
-		bpos_to_disk_accounting_pos(&k, acc->k.data[i].pos);
+		bpos_to_disk_accounting_pos(&k, e->pos);
 
 		u64 v[BCH_ACCOUNTING_MAX_COUNTERS];
-		bch2_accounting_mem_read_counters(acc, i, v, ARRAY_SIZE(v), false);
+		bch2_accounting_mem_read_counters(e, v, ARRAY_SIZE(v), false);
 
-		accounting_key_check_sanity(&underflow_err.m, c, &k, v, acc->k.data[i].nr_counters);
+		accounting_key_check_sanity(&underflow_err.m, c, &k, v, e->nr_counters);
 
 		guard(preempt)();
 		struct bch_fs_usage_base *usage = &this_cpu_ptr(c->capacity.pcpu)->usage;
