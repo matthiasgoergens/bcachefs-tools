@@ -710,6 +710,15 @@ struct btree_trans {
 	u32			commit_count;
 
 	u64			last_begin_time;
+	/*
+	 * When this locked section started, for the lock-hold-time yield in
+	 * bch2_trans_begin(). Distinct from last_begin_time (reset every
+	 * iteration, so it can never accumulate) and from
+	 * locking_wait.trans_start_time (which six_lock uses to order waiters
+	 * and must keep per-attempt semantics). Cleared only in
+	 * trans_set_unlocked(), i.e. only when locks are genuinely dropped.
+	 */
+	u64			last_yield_time;
 	unsigned long		last_begin_ip;
 	unsigned long		last_restarted_ip;
 #ifdef CONFIG_BCACHEFS_DEBUG

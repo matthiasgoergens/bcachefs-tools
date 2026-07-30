@@ -3851,6 +3851,15 @@ u32 bch2_trans_begin(struct btree_trans *trans)
 		     time_after(jiffies, trans->srcu_lock_time + msecs_to_jiffies(10))))
 		bch2_trans_unlock_long(trans);
 
+	/*
+	 * Arm the lock-hold deadline only after the unlock_long above has had its
+	 * chance to run: it drops locks, which clears last_yield_time, and arming
+	 * before it would leave the deadline compared against 0 — trivially
+	 * expired, so the next check yields for no reason.
+	 */
+	if (!trans->last_yield_time)
+		trans->last_yield_time = now;
+
 	/* Fresh attempt — re-arm the srcu-held-too-long warning (cleared after
 	 * the unlock_long above has had its chance to fire). */
 	trans->srcu_io_submitted = false;
@@ -3878,11 +3887,12 @@ u32 bch2_trans_begin(struct btree_trans *trans)
 		bch2_btree_path_traverse_all(trans);
 		trans->notrace_relock_fail = false;
 	} else if (need_resched() ||
-		   time_after64(now, trans->locking_wait.trans_start_time +
+		   time_after64(now, trans->last_yield_time +
 				BTREE_TRANS_MAX_LOCK_HOLD_TIME_NS)) {
 		bch2_trans_unlock(trans);
 		cond_resched();
 		now = local_clock();
+		trans->last_yield_time = now;
 	}
 
 	trans_set_locked(trans, false);

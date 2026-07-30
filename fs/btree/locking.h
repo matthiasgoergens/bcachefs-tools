@@ -87,6 +87,7 @@ static inline void trans_set_unlocked(struct btree_trans *trans)
 	if (trans->locked) {
 		trans->locked = false;
 		trans->last_unlock_ip = _RET_IP_;
+		trans->last_yield_time = 0;
 		lock_release(&trans->dep_map, _THIS_IP_);
 
 		if (!trans->pf_memalloc_noio)
