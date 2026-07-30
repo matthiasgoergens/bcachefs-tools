@@ -66,6 +66,26 @@
  * bch2_accounting_mem_mod() tells it to.
  */
 
+DEFINE_DARRAY_NAMED(darray_bpos, struct bpos);
+
+/*
+ * Snapshot the keys of every live entry, for loops that commit as they go.
+ *
+ * A btree commit runs the accounting commit hook, which inserts into this very
+ * table - and inserting re-sorts it. So a loop that commits can't hold an entry
+ * pointer across the commit: it iterates keys instead and looks each one up,
+ * skipping anything that went away in the meantime.
+ */
+static int accounting_mem_snapshot_keys(struct bch_fs *c, darray_bpos *keys)
+{
+	struct bch_accounting_mem *acc = &c->accounting;
+
+	darray_for_each(acc->k, e)
+		if (darray_push(keys, e->pos))
+			return bch_err_throw(c, ENOMEM_disk_accounting);
+	return 0;
+}
+
 static const char * const disk_accounting_type_strs[] = {
 #define x(t, n, ...) [n] = #t,
 	BCH_DISK_ACCOUNTING_TYPES()
@@ -1027,31 +1047,28 @@ static int accounting_read_mem_fixups(struct btree_trans *trans)
 	struct bch_accounting_mem *acc = &c->accounting;
 
 	/*
-	 * Filter zeroed/invalid entries with an in-place forward pass.
-	 *
-	 * We previously did this reverse-iterating + darray_remove_item per
-	 * dropped entry, which is O(N*R) memmove (each remove shifts the tail
-	 * back). On large arrays the replicas table grows combinatorially with
-	 * device count, and many entries come back zero on read, so the cost
-	 * was dominating mount time on big multi-device filesystems.
-	 *
-	 * Caller (bch2_accounting_read) has already sorted acc->k; forward
-	 * filter preserves that order.
+	 * bch2_disk_accounting_validate_late() commits, so we iterate keys and
+	 * re-look-up - see accounting_mem_snapshot_keys().
 	 */
-	struct accounting_mem_entry *src = acc->k.data;
-	struct accounting_mem_entry *dst = acc->k.data;
-	struct accounting_mem_entry *end = acc->k.data + acc->k.nr;
-	int ret = 0;
+	CLASS(darray_bpos, keys)();
+	try(accounting_mem_snapshot_keys(c, &keys));
 
-	while (src < end) {
+	bool have_marked = false;
+
+	darray_for_each(keys, key) {
+		struct accounting_mem_entry *e = accounting_mem_lookup(acc, *key);
+		if (!e)
+			continue;
+
 		struct disk_accounting_pos acc_k;
-		bpos_to_disk_accounting_pos(&acc_k, src->pos);
+		bpos_to_disk_accounting_pos(&acc_k, e->pos);
 
+		unsigned nr_counters = e->nr_counters;
 		u64 v[BCH_ACCOUNTING_MAX_COUNTERS];
 		memset(v, 0, sizeof(v));
 
-		for (unsigned j = 0; j < src->nr_counters; j++)
-			v[j] = percpu_u64_get(src->v[0] + j);
+		for (unsigned j = 0; j < nr_counters; j++)
+			v[j] = percpu_u64_get(e->v[0] + j);
 
 		/*
 		 * If the entry counters are zeroed, it should be treated as
@@ -1060,44 +1077,54 @@ static int accounting_read_mem_fixups(struct btree_trans *trans)
 		 * Drop it, so that if it's re-added it gets re-marked in the
 		 * superblock:
 		 */
-		ret = bch2_is_zero(v, sizeof(v[0]) * src->nr_counters)
+		int ret = bch2_is_zero(v, sizeof(v[0]) * nr_counters)
 			? -BCH_ERR_remove_disk_accounting_entry
 			: lockrestart_do(trans,
-				bch2_disk_accounting_validate_late(trans, &acc_k, v, src->nr_counters));
+				bch2_disk_accounting_validate_late(trans, &acc_k, v, nr_counters));
 
 		if (ret == -BCH_ERR_remove_disk_accounting_entry) {
-			free_percpu(src->v[0]);
-			free_percpu(src->v[1]);
-			src++;
-			ret = 0;
+			/* re-lookup: validate_late may have re-sorted the array */
+			e = accounting_mem_lookup(acc, *key);
+			if (e) {
+				free_percpu(e->v[0]);
+				free_percpu(e->v[1]);
+
+				/*
+				 * Mark for the sweep below rather than removing
+				 * here: removing one at a time is O(N*R)
+				 * memmove, and on big multi-device filesystems
+				 * the replicas table grows combinatorially with
+				 * device count and many entries come back zero,
+				 * so that dominated mount time.
+				 *
+				 * nr_counters is the mark, not a NULL v[0]:
+				 * everything that touches an entry's counters
+				 * bounds itself by min(nr, e->nr_counters), so a
+				 * commit that looks this key up before the sweep
+				 * drops its delta instead of dereferencing freed
+				 * storage.
+				 */
+				e->v[0] = NULL;
+				e->v[1] = NULL;
+				e->nr_counters = 0;
+				have_marked = true;
+			}
 			continue;
 		}
 
-		if (dst != src)
-			*dst = *src;
-		dst++;
-		src++;
-
 		if (ret)
-			break;
+			return ret;
 	}
 
-	/*
-	 * On error: shift unprocessed tail down so the array stays a
-	 * contiguous run of valid entries. Avoids leaking percpu storage on
-	 * any retry path that reads acc->k.nr.
-	 */
-	while (src < end) {
-		if (dst != src)
-			*dst = *src;
-		dst++;
-		src++;
+	if (have_marked) {
+		struct accounting_mem_entry *dst = acc->k.data;
+
+		darray_for_each(acc->k, src)
+			if (src->nr_counters)
+				*dst++ = *src;
+
+		acc->k.nr = dst - acc->k.data;
 	}
-
-	acc->k.nr = dst - acc->k.data;
-
-	if (ret)
-		return ret;
 
 	eytzinger0_sort(acc->k.data, acc->k.nr, sizeof(acc->k.data[0]),
 			accounting_pos_cmp, NULL);
