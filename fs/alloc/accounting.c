@@ -100,29 +100,13 @@ static const unsigned bch2_accounting_type_nr_counters[] = {
 #undef x
 };
 
-static inline void __accounting_key_init(struct bkey_i *k, struct bpos pos,
-					 s64 *d, unsigned nr)
-{
-	struct bkey_i_accounting *acc = bkey_accounting_init(k);
-
-	acc->k.p = pos;
-	set_bkey_val_u64s(&acc->k, sizeof(struct bch_accounting) / sizeof(u64) + nr);
-
-	memcpy_u64s_small(acc->v.d, d, nr);
-}
-
-static inline void accounting_key_init(struct bkey_i *k, struct disk_accounting_pos *pos,
-				       s64 *d, unsigned nr)
-{
-	return __accounting_key_init(k, disk_accounting_pos_to_bpos(pos), d, nr);
-}
-
 static int bch2_accounting_update_sb_one(struct bch_fs *, struct bpos);
 
-int bch2_accounting_mem_add(struct btree_trans *trans, struct bkey_s_c_accounting a,
+int bch2_accounting_mem_add(struct btree_trans *trans, struct bpos pos,
+			    const s64 *d, unsigned d_nr,
 			    enum bch_accounting_mode mode, bool write_locked)
 {
-	return bch2_accounting_mem_add_inlined(trans, a, mode, write_locked);
+	return bch2_accounting_mem_add_inlined(trans, pos, d, d_nr, mode, write_locked);
 }
 
 int bch2_disk_accounting_mod_normal(struct btree_trans *trans,
@@ -166,7 +150,10 @@ int bch2_disk_accounting_mod_normal(struct btree_trans *trans,
 	unsigned u64s = sizeof(*a) / sizeof(u64) + nr;
 	a = errptr_try(bch2_trans_subbuf_alloc(trans, &trans->accounting, u64s));
 
-	__accounting_key_init(&a->k_i, pos, d, nr);
+	bkey_accounting_init(&a->k_i);
+	a->k.p = pos;
+	set_bkey_val_u64s(&a->k, sizeof(struct bch_accounting) / sizeof(u64) + nr);
+	memcpy_u64s_small(a->v.d, d, nr);
 	return 0;
 }
 
@@ -186,22 +173,18 @@ int bch2_disk_accounting_mod_gc(struct btree_trans *trans,
 		break;
 	}
 
-	struct { __BKEY_PADDED(k, BCH_ACCOUNTING_MAX_COUNTERS); } k_i;
-
-	__accounting_key_init(&k_i.k, disk_accounting_pos_to_bpos(k), d, nr);
-
+	struct bpos pos = disk_accounting_pos_to_bpos(k);
 	int ret = 0;
 
 	while (true) {
 		scoped_guard(percpu_read_noio, &trans->c->capacity.mark_lock)
-			ret = bch2_accounting_mem_add_inlined(trans,
-						bkey_i_to_s_c_accounting(&k_i.k),
+			ret = bch2_accounting_mem_add_inlined(trans, pos, d, nr,
 						BCH_ACCOUNTING_gc,
 						false);
 		if (likely(ret != -BCH_ERR_btree_insert_need_mark_replicas))
 			break;
 
-		ret = drop_locks_do(trans, bch2_accounting_update_sb_one(trans->c, k_i.k.k.p));
+		ret = drop_locks_do(trans, bch2_accounting_update_sb_one(trans->c, pos));
 		if (ret)
 			break;
 	}
@@ -425,19 +408,19 @@ int bch2_accounting_update_sb(struct btree_trans *trans)
 	return 0;
 }
 
-static int __bch2_accounting_mem_insert(struct bch_fs *c, struct bkey_s_c_accounting a)
+static int __bch2_accounting_mem_insert(struct bch_fs *c, struct bpos pos)
 {
 	struct bch_accounting_mem *acc = &c->accounting;
 
 	/* raced with another insert, already present: */
-	if (accounting_mem_lookup(acc, a.k->p))
+	if (accounting_mem_lookup(acc, pos))
 		return 0;
 
 	struct disk_accounting_pos acc_k;
-	bpos_to_disk_accounting_pos(&acc_k, a.k->p);
+	bpos_to_disk_accounting_pos(&acc_k, pos);
 
 	struct accounting_mem_entry n = {
-		.pos		= a.k->p,
+		.pos		= pos,
 		.nr_counters	= bch2_accounting_type_nr_counters[acc_k.type],
 		.v[0]		= __alloc_percpu_gfp(n.nr_counters * sizeof(u64),
 						     sizeof(u64), GFP_KERNEL),
@@ -471,7 +454,7 @@ static int __bch2_accounting_mem_insert(struct bch_fs *c, struct bkey_s_c_accoun
 
 	event_trace(c, accounting_mem_insert, buf, ({
 		prt_printf(&buf, "entries %zu added ", acc->t.nr);
-		bch2_accounting_to_text(&buf, c, a.s_c);
+		bch2_accounting_key_to_text(&buf, c, &acc_k);
 	}));
 
 	return 0;
@@ -481,13 +464,13 @@ err:
 	return bch_err_throw(c, ENOMEM_disk_accounting);
 }
 
-int bch2_accounting_mem_insert(struct bch_fs *c, struct bkey_s_c_accounting a,
+int bch2_accounting_mem_insert(struct bch_fs *c, struct bpos pos,
 			       enum bch_accounting_mode mode)
 {
 	union bch_replicas_padded r;
 
 	if (mode != BCH_ACCOUNTING_read &&
-	    accounting_to_replicas(&r.e, a.k->p) &&
+	    accounting_to_replicas(&r.e, pos) &&
 	    !bch2_replicas_marked_locked(c, &r.e))
 		return bch_err_throw(c, btree_insert_need_mark_replicas);
 
@@ -500,22 +483,22 @@ int bch2_accounting_mem_insert(struct bch_fs *c, struct bkey_s_c_accounting a,
 	percpu_up_read(&c->capacity.mark_lock.lock);
 	int ret;
 	scoped_guard(percpu_write_noio, &c->capacity.mark_lock)
-		ret = __bch2_accounting_mem_insert(c, a);
+		ret = __bch2_accounting_mem_insert(c, pos);
 	percpu_down_read(&c->capacity.mark_lock.lock);
 	return ret;
 }
 
-int bch2_accounting_mem_insert_locked(struct bch_fs *c, struct bkey_s_c_accounting a,
+int bch2_accounting_mem_insert_locked(struct bch_fs *c, struct bpos pos,
 			       enum bch_accounting_mode mode)
 {
 	union bch_replicas_padded r;
 
 	if (mode != BCH_ACCOUNTING_read &&
-	    accounting_to_replicas(&r.e, a.k->p) &&
+	    accounting_to_replicas(&r.e, pos) &&
 	    !bch2_replicas_marked_locked(c, &r.e))
 		return bch_err_throw(c, btree_insert_need_mark_replicas);
 
-	return __bch2_accounting_mem_insert(c, a);
+	return __bch2_accounting_mem_insert(c, pos);
 }
 
 static bool accounting_mem_entry_is_zero(struct accounting_mem_entry *e)
@@ -791,11 +774,14 @@ int bch2_gc_accounting_done(struct bch_fs *c)
 
 				if (!test_bit(BCH_FS_may_go_rw, &c->flags)) {
 					memset(&trans->fs_usage_delta, 0, sizeof(trans->fs_usage_delta));
-					struct { __BKEY_PADDED(k, BCH_ACCOUNTING_MAX_COUNTERS); } k_i;
 
-					accounting_key_init(&k_i.k, &acc_k, src_v, nr);
-					bch2_accounting_mem_add(trans,
-								bkey_i_to_s_c_accounting(&k_i.k),
+					/*
+					 * Not e->pos: the commit above dropped
+					 * mark_lock and inserted into the mem
+					 * table, so e may have been rehomed or
+					 * the table reallocated.
+					 */
+					bch2_accounting_mem_add(trans, *key, src_v, nr,
 								BCH_ACCOUNTING_normal, true);
 
 					guard(preempt)();
@@ -859,7 +845,7 @@ static int accounting_read_key(struct btree_trans *trans, struct bkey_s_c k)
 	struct accounting_mem_entry *e;
 
 	while (!(e = accounting_mem_lookup(acc, a.k->p)))
-		try(bch2_accounting_mem_insert_locked(c, a, BCH_ACCOUNTING_read));
+		try(bch2_accounting_mem_insert_locked(c, a.k->p, BCH_ACCOUNTING_read));
 
 	nr = min_t(unsigned, nr, e->nr_counters);
 	for (unsigned i = 0; i < nr; i++)

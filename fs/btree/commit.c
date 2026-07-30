@@ -934,8 +934,11 @@ retry:
 	for (accounting = btree_trans_subbuf_base(trans, &trans->accounting);
 	     accounting != btree_trans_subbuf_top(trans, &trans->accounting);
 	     accounting = bkey_next(accounting)) {
+		struct bkey_s_c_accounting a = bkey_i_to_s_c_accounting(accounting);
+
 		ret = likely(!(flags & BCH_TRANS_COMMIT_skip_accounting_apply))
-			? bch2_accounting_mem_add(trans, bkey_i_to_s_c_accounting(accounting),
+			? bch2_accounting_mem_add(trans, a.k->p, a.v->d,
+						  bch2_accounting_counters(a.k),
 						  BCH_ACCOUNTING_normal, false)
 			: 0;
 		if (ret)

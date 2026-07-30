@@ -201,8 +201,8 @@ enum bch_accounting_mode {
 	BCH_ACCOUNTING_read,
 };
 
-int bch2_accounting_mem_insert(struct bch_fs *, struct bkey_s_c_accounting, enum bch_accounting_mode);
-int bch2_accounting_mem_insert_locked(struct bch_fs *, struct bkey_s_c_accounting, enum bch_accounting_mode);
+int bch2_accounting_mem_insert(struct bch_fs *, struct bpos, enum bch_accounting_mode);
+int bch2_accounting_mem_insert_locked(struct bch_fs *, struct bpos, enum bch_accounting_mode);
 void bch2_accounting_mem_gc(struct bch_fs *);
 
 int bch2_accounting_btree_read(struct btree_trans *, struct bpos, u64 *, unsigned);
@@ -226,17 +226,23 @@ static inline bool bch2_bkey_is_accounting_mem(struct bkey *k)
 /*
  * Update in memory counters so they match the btree update we're doing; called
  * from transaction commit path
+ *
+ * Takes the counter's position and deltas, not a bkey: the gc triggers call this
+ * once per pointer per key, and they have no key to hand - building one just to
+ * take it apart again cost a ~64 byte stack object, a bkey init and a memcpy of
+ * the deltas on every call.
  */
 static __always_inline
 int bch2_accounting_mem_add_inlined(struct btree_trans *trans,
-				   struct bkey_s_c_accounting a,
+				   struct bpos pos,
+				   const s64 *d, unsigned d_nr,
 				   enum bch_accounting_mode mode,
 				   bool write_locked)
 {
 	struct bch_fs *c = trans->c;
 	struct bch_accounting_mem *acc = &c->accounting;
 	struct disk_accounting_pos acc_k;
-	bpos_to_disk_accounting_pos(&acc_k, a.k->p);
+	bpos_to_disk_accounting_pos(&acc_k, pos);
 	bool gc = mode == BCH_ACCOUNTING_gc;
 
 	if (gc && !acc->gc_running)
@@ -248,22 +254,22 @@ int bch2_accounting_mem_add_inlined(struct btree_trans *trans,
 	if (mode == BCH_ACCOUNTING_normal) {
 		switch (acc_k.type) {
 		case BCH_DISK_ACCOUNTING_persistent_reserved:
-			trans->fs_usage_delta.reserved += acc_k.persistent_reserved.nr_replicas * a.v->d[0];
+			trans->fs_usage_delta.reserved += acc_k.persistent_reserved.nr_replicas * d[0];
 			break;
 		case BCH_DISK_ACCOUNTING_replicas:
-			fs_usage_data_type_to_base(&trans->fs_usage_delta, acc_k.replicas.data_type, a.v->d[0]);
+			fs_usage_data_type_to_base(&trans->fs_usage_delta, acc_k.replicas.data_type, d[0]);
 			break;
 		case BCH_DISK_ACCOUNTING_dev_data_type: {
 			guard(rcu)();
 			const enum bch_data_type data_type = acc_k.dev_data_type.data_type;
 			struct bch_dev *ca = bch2_dev_rcu_noerror(c, acc_k.dev_data_type.dev);
 			if (ca) {
-				this_cpu_add(ca->usage->d[data_type].buckets, a.v->d[0]);
-				this_cpu_add(ca->usage->d[data_type].sectors, a.v->d[1]);
-				this_cpu_add(ca->usage->d[data_type].fragmented, a.v->d[2]);
+				this_cpu_add(ca->usage->d[data_type].buckets, d[0]);
+				this_cpu_add(ca->usage->d[data_type].sectors, d[1]);
+				this_cpu_add(ca->usage->d[data_type].fragmented, d[2]);
 
 				if (data_type == BCH_DATA_sb || data_type == BCH_DATA_journal)
-					trans->fs_usage_delta.hidden += a.v->d[0] * ca->mi.bucket_size;
+					trans->fs_usage_delta.hidden += d[0] * ca->mi.bucket_size;
 			}
 			break;
 		}
@@ -272,21 +278,21 @@ int bch2_accounting_mem_add_inlined(struct btree_trans *trans,
 
 	struct accounting_mem_entry *e;
 
-	while (!(e = accounting_mem_lookup(acc, a.k->p))) {
+	while (!(e = accounting_mem_lookup(acc, pos))) {
 		if (unlikely(write_locked))
-			try(bch2_accounting_mem_insert_locked(c, a, mode));
+			try(bch2_accounting_mem_insert_locked(c, pos, mode));
 		else
-			try(bch2_accounting_mem_insert(c, a, mode));
+			try(bch2_accounting_mem_insert(c, pos, mode));
 	}
 
-	const unsigned nr = min_t(unsigned, bch2_accounting_counters(a.k), e->nr_counters);
+	const unsigned nr = min_t(unsigned, d_nr, e->nr_counters);
 
 	for (unsigned i = 0; i < nr; i++)
-		this_cpu_add(e->v[gc][i], a.v->d[i]);
+		this_cpu_add(e->v[gc][i], d[i]);
 	return 0;
 }
 
-int bch2_accounting_mem_add(struct btree_trans *, struct bkey_s_c_accounting,
+int bch2_accounting_mem_add(struct btree_trans *, struct bpos, const s64 *, unsigned,
 			    enum bch_accounting_mode, bool);
 
 static inline void bch2_accounting_mem_read_counters(struct accounting_mem_entry *e,
@@ -353,7 +359,9 @@ static inline int bch2_accounting_trans_commit_hook(struct btree_trans *trans,
 	EBUG_ON(bversion_zero(a->k.bversion));
 
 	return likely(!(commit_flags & BCH_TRANS_COMMIT_skip_accounting_apply))
-		? bch2_accounting_mem_add_inlined(trans, accounting_i_to_s_c(a), BCH_ACCOUNTING_normal, false)
+		? bch2_accounting_mem_add_inlined(trans, a->k.p,
+						  a->v.d, bch2_accounting_counters(&a->k),
+						  BCH_ACCOUNTING_normal, false)
 		: 0;
 }
 
@@ -365,7 +373,9 @@ static inline void bch2_accounting_trans_commit_revert(struct btree_trans *trans
 		struct bkey_s_accounting a = accounting_i_to_s(a_i);
 
 		bch2_accounting_neg(a);
-		bch2_accounting_mem_add(trans, a.c, BCH_ACCOUNTING_normal, false);
+		bch2_accounting_mem_add(trans, a.k->p, a.v->d,
+					bch2_accounting_counters(a.k),
+					BCH_ACCOUNTING_normal, false);
 		bch2_accounting_neg(a);
 	}
 }
