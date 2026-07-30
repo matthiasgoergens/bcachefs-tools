@@ -4,7 +4,6 @@
 
 #include "btree/update.h"
 #include "sb/members.h"
-#include "util/eytzinger.h"
 
 static inline void bch2_u64s_neg(u64 *v, unsigned nr)
 {
@@ -142,11 +141,58 @@ void bch2_accounting_swab(const struct bch_fs *, struct bkey_s);
 
 int bch2_accounting_update_sb(struct btree_trans *);
 
-static inline int accounting_pos_cmp(const void *_l, const void *_r)
+static inline bool accounting_mem_entry_empty(const void *_e)
 {
-	const struct bpos *l = _l, *r = _r;
+	const struct accounting_mem_entry *e = _e;
 
-	return bpos_cmp(*l, *r);
+	return !e->v[0];
+}
+
+/*
+ * The mem table is a cuckoo hash indexed by the accounting key's bpos, so a
+ * lookup is two slots instead of an eytzinger descent - and inserting doesn't
+ * disturb any other entry, which the sorted array couldn't manage.
+ *
+ * static const so the entry size, key offset and the ops calls all constant
+ * fold into the callers.
+ */
+static const struct cuckoo_ops accounting_cuckoo_ops = {
+	.entry_size	= sizeof(struct accounting_mem_entry),
+	.key_offset	= offsetof(struct accounting_mem_entry, pos),
+	.key_size	= sizeof(struct bpos),
+	.hash		= cuckoo_siphash13,
+	.entry_empty	= accounting_mem_entry_empty,
+};
+
+#define ACCOUNTING_MEM_MIN_SLOTS	64
+
+static inline struct accounting_mem_entry *
+accounting_mem_lookup(struct bch_accounting_mem *acc, struct bpos pos)
+{
+	return cuckoo_lookup(&acc->t, &accounting_cuckoo_ops, &pos);
+}
+
+/* Iterates the live entries, in no particular order */
+#define accounting_mem_for_each(_acc, _e)					\
+	for (struct accounting_mem_entry *_e = cuckoo_next_live(&(_acc)->t,	\
+					&accounting_cuckoo_ops, (_acc)->t.slots);\
+	     _e;								\
+	     _e = cuckoo_next_live(&(_acc)->t, &accounting_cuckoo_ops, _e + 1))
+
+static inline void accounting_mem_remove(struct bch_accounting_mem *acc,
+					 struct accounting_mem_entry *e)
+{
+	free_percpu(e->v[0]);
+	free_percpu(e->v[1]);
+
+	cuckoo_remove(&acc->t, &accounting_cuckoo_ops, e);
+}
+
+/* Drop every entry, keeping the table allocated */
+static inline void accounting_mem_clear(struct bch_accounting_mem *acc)
+{
+	accounting_mem_for_each(acc, e)
+		accounting_mem_remove(acc, e);
 }
 
 enum bch_accounting_mode {
@@ -158,15 +204,6 @@ enum bch_accounting_mode {
 int bch2_accounting_mem_insert(struct bch_fs *, struct bkey_s_c_accounting, enum bch_accounting_mode);
 int bch2_accounting_mem_insert_locked(struct bch_fs *, struct bkey_s_c_accounting, enum bch_accounting_mode);
 void bch2_accounting_mem_gc(struct bch_fs *);
-
-static inline struct accounting_mem_entry *
-accounting_mem_lookup(struct bch_accounting_mem *acc, struct bpos pos)
-{
-	unsigned idx = eytzinger0_find(acc->k.data, acc->k.nr, sizeof(acc->k.data[0]),
-				       accounting_pos_cmp, &pos);
-
-	return idx < acc->k.nr ? acc->k.data + idx : NULL;
-}
 
 int bch2_accounting_btree_read(struct btree_trans *, struct bpos, u64 *, unsigned);
 

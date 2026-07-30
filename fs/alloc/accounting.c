@@ -29,9 +29,9 @@
  *    apply to existing values. But reading from a write buffer btree is
  *    expensive, so we also have
  *
- *  - In memory accounting, where accounting is stored as an array of percpu
- *    counters, indexed by an eytzinger array of disk acounting keys/bpos (which
- *    are the same thing, excepting byte swabbing on big endian).
+ *  - In memory accounting, where accounting is stored as percpu counters,
+ *    indexed by a cuckoo hash table keyed on the disk accounting key/bpos
+ *    (which are the same thing, excepting byte swabbing on big endian).
  *
  *    Cheap to read, but non persistent.
  *
@@ -72,15 +72,16 @@ DEFINE_DARRAY_NAMED(darray_bpos, struct bpos);
  * Snapshot the keys of every live entry, for loops that commit as they go.
  *
  * A btree commit runs the accounting commit hook, which inserts into this very
- * table - and inserting re-sorts it. So a loop that commits can't hold an entry
- * pointer across the commit: it iterates keys instead and looks each one up,
- * skipping anything that went away in the meantime.
+ * table - and an insert rehomes other entries or reallocates the table
+ * entirely. So a loop that commits can't hold an entry pointer, or walk the
+ * table itself. It iterates keys instead and looks each one up, skipping
+ * anything that went away in the meantime.
  */
 static int accounting_mem_snapshot_keys(struct bch_fs *c, darray_bpos *keys)
 {
 	struct bch_accounting_mem *acc = &c->accounting;
 
-	darray_for_each(acc->k, e)
+	accounting_mem_for_each(acc, e)
 		if (darray_push(keys, e->pos))
 			return bch_err_throw(c, ENOMEM_disk_accounting);
 	return 0;
@@ -453,14 +454,24 @@ static int __bch2_accounting_mem_insert(struct bch_fs *c, struct bkey_s_c_accoun
 			goto err;
 	}
 
-	if (darray_push(&acc->k, n))
-		goto err;
+	/*
+	 * Grow before we're at the load factor where inserts start doing long
+	 * eviction walks, and again if one runs out anyway. A failed insert
+	 * leaves @n holding our own entry (cuckoo_insert() unwinds the walk), so
+	 * the error path below is free to release its counters.
+	 */
+	while (cuckoo_too_full(&acc->t) ||
+	       !cuckoo_insert(&acc->t, &accounting_cuckoo_ops, &n)) {
+		size_t nr_slots = acc->t.slots
+			? (acc->t.mask + 1) * 2
+			: ACCOUNTING_MEM_MIN_SLOTS;
 
-	eytzinger0_sort(acc->k.data, acc->k.nr, sizeof(acc->k.data[0]),
-			accounting_pos_cmp, NULL);
+		if (!cuckoo_resize(&acc->t, &accounting_cuckoo_ops, nr_slots, GFP_KERNEL))
+			goto err;
+	}
 
 	event_trace(c, accounting_mem_insert, buf, ({
-		prt_printf(&buf, "entries %zu added ", c->accounting.k.nr);
+		prt_printf(&buf, "entries %zu added ", acc->t.nr);
 		bch2_accounting_to_text(&buf, c, a.s_c);
 	}));
 
@@ -542,13 +553,7 @@ void __bch2_accounting_maybe_kill(struct bch_fs *c, struct bpos pos)
 		if (!accounting_mem_entry_is_zero(e))
 			return;
 
-		free_percpu(e->v[0]);
-		free_percpu(e->v[1]);
-
-		swap(*e, darray_last(acc->k));
-		--acc->k.nr;
-		eytzinger0_sort(acc->k.data, acc->k.nr, sizeof(acc->k.data[0]),
-				accounting_pos_cmp, NULL);
+		accounting_mem_remove(acc, e);
 
 		bch2_replicas_entry_kill(c, &acc_k.replicas);
 	}
@@ -585,20 +590,10 @@ void bch2_accounting_mem_gc(struct bch_fs *c)
 	struct bch_accounting_mem *acc = &c->accounting;
 
 	guard(percpu_write_noio)(&c->capacity.mark_lock);
-	struct accounting_mem_entry *dst = acc->k.data;
 
-	darray_for_each(acc->k, src) {
-		if (accounting_mem_entry_is_zero(src)) {
-			free_percpu(src->v[0]);
-			free_percpu(src->v[1]);
-		} else {
-			*dst++ = *src;
-		}
-	}
-
-	acc->k.nr = dst - acc->k.data;
-	eytzinger0_sort(acc->k.data, acc->k.nr, sizeof(acc->k.data[0]),
-			accounting_pos_cmp, NULL);
+	accounting_mem_for_each(acc, e)
+		if (accounting_mem_entry_is_zero(e))
+			accounting_mem_remove(acc, e);
 }
 
 /*
@@ -614,7 +609,7 @@ int bch2_fs_replicas_usage_read(struct bch_fs *c, darray_char *usage)
 	struct bch_accounting_mem *acc = &c->accounting;
 
 	guard(percpu_read_noio)(&c->capacity.mark_lock);
-	darray_for_each(acc->k, i) {
+	accounting_mem_for_each(acc, i) {
 		union {
 			u8 bytes[struct_size_t(struct bch_replicas_usage, r.devs,
 					       BCH_BKEY_PTRS_MAX)];
@@ -646,7 +641,7 @@ int bch2_fs_accounting_read(struct bch_fs *c, darray_char *out_buf, unsigned acc
 	darray_init(out_buf);
 
 	guard(percpu_read_noio)(&c->capacity.mark_lock);
-	darray_for_each(acc->k, i) {
+	accounting_mem_for_each(acc, i) {
 		struct disk_accounting_pos a_p;
 		bpos_to_disk_accounting_pos(&a_p, i->pos);
 
@@ -694,11 +689,16 @@ int bch2_fs_accounting_read_key(struct btree_trans *trans,
 	return 0;
 }
 
-static void bch2_accounting_free_counters(struct bch_accounting_mem *acc, bool gc)
+/*
+ * gc counters only: v[0] is the hash table's slot-in-use marker, so clearing it
+ * would empty the table out from under acc->t.nr. Dropping normal counters is
+ * accounting_mem_clear()'s job.
+ */
+static void bch2_accounting_free_gc_counters(struct bch_accounting_mem *acc)
 {
-	darray_for_each(acc->k, e) {
-		free_percpu(e->v[gc]);
-		e->v[gc] = NULL;
+	accounting_mem_for_each(acc, e) {
+		free_percpu(e->v[1]);
+		e->v[1] = NULL;
 	}
 }
 
@@ -709,11 +709,11 @@ int bch2_gc_accounting_start(struct bch_fs *c)
 
 	guard(percpu_write_noio)(&c->capacity.mark_lock);
 
-	darray_for_each(acc->k, e) {
+	accounting_mem_for_each(acc, e) {
 		e->v[1] = __alloc_percpu_gfp(e->nr_counters * sizeof(u64),
 					     sizeof(u64), GFP_KERNEL);
 		if (!e->v[1]) {
-			bch2_accounting_free_counters(acc, true);
+			bch2_accounting_free_gc_counters(acc);
 			ret = bch_err_throw(c, ENOMEM_disk_accounting);
 			break;
 		}
@@ -728,20 +728,20 @@ int bch2_gc_accounting_done(struct bch_fs *c)
 	struct bch_accounting_mem *acc = &c->accounting;
 	CLASS(btree_trans, trans)(c);
 	CLASS(printbuf, buf)();
-	struct bpos pos = POS_MIN;
 	int ret = 0;
 
 	guard(percpu_write_noio)(&c->capacity.mark_lock);
 
-	while (1) {
-		unsigned idx = eytzinger0_find_ge(acc->k.data, acc->k.nr, sizeof(acc->k.data[0]),
-						  accounting_pos_cmp, &pos);
+	/* We commit corrections as we go: see accounting_mem_snapshot_keys() */
+	CLASS(darray_bpos, keys)();
+	ret = accounting_mem_snapshot_keys(c, &keys);
+	if (ret)
+		goto err;
 
-		if (idx >= acc->k.nr)
-			break;
-
-		struct accounting_mem_entry *e = acc->k.data + idx;
-		pos = bpos_successor(e->pos);
+	darray_for_each(keys, key) {
+		struct accounting_mem_entry *e = accounting_mem_lookup(acc, *key);
+		if (!e)
+			continue;
 
 		struct disk_accounting_pos acc_k;
 		bpos_to_disk_accounting_pos(&acc_k, e->pos);
@@ -853,42 +853,18 @@ static int accounting_read_key(struct btree_trans *trans, struct bkey_s_c k)
 	/* Caller holds percpu_write on mark_lock */
 
 	/*
-	 * Accumulate into last entry if same bpos - this happens when both
-	 * btree and journal keys exist for the same accounting entry
-	 * (journal key = delta on top of btree base value).
-	 *
-	 * The btree/journal walk in bch2_accounting_read() processes keys
-	 * in bpos order, so duplicates are always adjacent.
+	 * Both a btree and a journal key can exist for the same counter, the
+	 * journal key being a delta on top of the btree base value - so
+	 * accumulate if we've already got the entry.
 	 */
-	if (acc->k.nr && bpos_eq(darray_last(acc->k).pos, a.k->p)) {
-		struct accounting_mem_entry *e = &darray_last(acc->k);
-		nr = min_t(unsigned, nr, e->nr_counters);
-		for (unsigned i = 0; i < nr; i++)
-			percpu_u64_set(e->v[0] + i,
-				       percpu_u64_get(e->v[0] + i) + a.v->d[i]);
-		return 0;
-	}
+	struct accounting_mem_entry *e;
 
-	struct accounting_mem_entry n = {
-		.pos		= a.k->p,
-		.bversion	= a.k->bversion,
-		.nr_counters	= bch2_accounting_type_nr_counters[acc_k.type],
-	};
+	while (!(e = accounting_mem_lookup(acc, a.k->p)))
+		try(bch2_accounting_mem_insert_locked(c, a, BCH_ACCOUNTING_read));
 
-	n.v[0] = __alloc_percpu_gfp(n.nr_counters * sizeof(u64),
-				     sizeof(u64), GFP_KERNEL);
-	if (!n.v[0])
-		return bch_err_throw(c, ENOMEM_disk_accounting);
-
-	if (darray_push(&acc->k, n)) {
-		free_percpu(n.v[0]);
-		return bch_err_throw(c, ENOMEM_disk_accounting);
-	}
-
-	struct accounting_mem_entry *e = &darray_last(acc->k);
 	nr = min_t(unsigned, nr, e->nr_counters);
 	for (unsigned i = 0; i < nr; i++)
-		percpu_u64_set(e->v[0] + i, a.v->d[i]);
+		percpu_u64_set(e->v[0] + i, percpu_u64_get(e->v[0] + i) + a.v->d[i]);
 
 	return 0;
 }
@@ -1047,13 +1023,11 @@ static int accounting_read_mem_fixups(struct btree_trans *trans)
 	struct bch_accounting_mem *acc = &c->accounting;
 
 	/*
-	 * bch2_disk_accounting_validate_late() commits, so we iterate keys and
-	 * re-look-up - see accounting_mem_snapshot_keys().
+	 * bch2_disk_accounting_validate_late() commits - see
+	 * accounting_mem_snapshot_keys()
 	 */
 	CLASS(darray_bpos, keys)();
 	try(accounting_mem_snapshot_keys(c, &keys));
-
-	bool have_marked = false;
 
 	darray_for_each(keys, key) {
 		struct accounting_mem_entry *e = accounting_mem_lookup(acc, *key);
@@ -1083,32 +1057,10 @@ static int accounting_read_mem_fixups(struct btree_trans *trans)
 				bch2_disk_accounting_validate_late(trans, &acc_k, v, nr_counters));
 
 		if (ret == -BCH_ERR_remove_disk_accounting_entry) {
-			/* re-lookup: validate_late may have re-sorted the array */
+			/* re-lookup: validate_late may have rehashed the table */
 			e = accounting_mem_lookup(acc, *key);
-			if (e) {
-				free_percpu(e->v[0]);
-				free_percpu(e->v[1]);
-
-				/*
-				 * Mark for the sweep below rather than removing
-				 * here: removing one at a time is O(N*R)
-				 * memmove, and on big multi-device filesystems
-				 * the replicas table grows combinatorially with
-				 * device count and many entries come back zero,
-				 * so that dominated mount time.
-				 *
-				 * nr_counters is the mark, not a NULL v[0]:
-				 * everything that touches an entry's counters
-				 * bounds itself by min(nr, e->nr_counters), so a
-				 * commit that looks this key up before the sweep
-				 * drops its delta instead of dereferencing freed
-				 * storage.
-				 */
-				e->v[0] = NULL;
-				e->v[1] = NULL;
-				e->nr_counters = 0;
-				have_marked = true;
-			}
+			if (e)
+				accounting_mem_remove(acc, e);
 			continue;
 		}
 
@@ -1116,23 +1068,10 @@ static int accounting_read_mem_fixups(struct btree_trans *trans)
 			return ret;
 	}
 
-	if (have_marked) {
-		struct accounting_mem_entry *dst = acc->k.data;
-
-		darray_for_each(acc->k, src)
-			if (src->nr_counters)
-				*dst++ = *src;
-
-		acc->k.nr = dst - acc->k.data;
-	}
-
-	eytzinger0_sort(acc->k.data, acc->k.nr, sizeof(acc->k.data[0]),
-			accounting_pos_cmp, NULL);
-
 	CLASS(bch_log_msg, underflow_err)(c);
 	underflow_err.m.suppress = true;
 
-	darray_for_each(acc->k, e) {
+	accounting_mem_for_each(acc, e) {
 		struct disk_accounting_pos k;
 		bpos_to_disk_accounting_pos(&k, e->pos);
 
@@ -1193,11 +1132,10 @@ int bch2_accounting_read(struct bch_fs *c)
 	 * btree node scan - and those might cause us to get different results,
 	 * so we can't just skip if we've already run.
 	 *
-	 * Free and re-initialize accounting - entries are appended unsorted
-	 * during the read and sorted once at the end, so we need a clean slate.
+	 * Free and re-initialize accounting - we need a clean slate. The table
+	 * itself is kept, so a second read doesn't have to grow it again.
 	 */
-	bch2_accounting_free_counters(acc, false);
-	acc->k.nr = 0;
+	accounting_mem_clear(acc);
 	for_each_member_device(c, ca)
 		percpu_memset(ca->usage, 0, sizeof(*ca->usage));
 	percpu_memset(&c->capacity.pcpu->usage, 0, sizeof(struct bch_fs_usage_base));
@@ -1282,22 +1220,6 @@ int bch2_accounting_read(struct bch_fs *c)
 		if (!i->overwritten)
 			*dst++ = *i;
 	keys->gap = keys->nr = dst - keys->data;
-
-	/*
-	 * Entries were inserted unsorted during the btree/journal walk above.
-	 * Sort now, before fixups which may need eytzinger lookups.
-	 */
-	eytzinger0_sort(acc->k.data, acc->k.nr, sizeof(acc->k.data[0]),
-			accounting_pos_cmp, NULL);
-
-	/* Assert no duplicates - the btree/journal walk must produce unique keys */
-	struct bpos prev;
-	bool have_prev = false;
-	eytzinger0_for_each(i, acc->k.nr) {
-		BUG_ON(have_prev && bpos_cmp(prev, acc->k.data[i].pos) >= 0);
-		prev = acc->k.data[i].pos;
-		have_prev = true;
-	}
 
 	/*
 	 * accounting_read_mem_fixups() does transaction commits to
@@ -1489,7 +1411,7 @@ void bch2_accounting_gc_free(struct bch_fs *c)
 
 	struct bch_accounting_mem *acc = &c->accounting;
 
-	bch2_accounting_free_counters(acc, true);
+	bch2_accounting_free_gc_counters(acc);
 	acc->gc_running = false;
 }
 
@@ -1497,6 +1419,6 @@ void bch2_fs_accounting_exit(struct bch_fs *c)
 {
 	struct bch_accounting_mem *acc = &c->accounting;
 
-	bch2_accounting_free_counters(acc, false);
-	darray_exit(&acc->k);
+	accounting_mem_clear(acc);
+	cuckoo_exit(&acc->t);
 }

@@ -527,9 +527,7 @@ int bch2_replicas_gc_accounted(struct bch_fs *c)
 
 			struct bpos p = disk_accounting_pos_to_bpos(&k);
 
-			struct bch_accounting_mem *acc = &c->accounting;
-			bool kill = eytzinger0_find(acc->k.data, acc->k.nr, sizeof(acc->k.data[0]),
-						    accounting_pos_cmp, &p) >= acc->k.nr;
+			bool kill = !accounting_mem_lookup(&c->accounting, p);
 
 			if (e->e.data_type == BCH_DATA_journal || !kill)
 				memcpy(cpu_replicas_entry(&new, new.nr++),
