@@ -1422,3 +1422,35 @@ void bch2_fs_accounting_exit(struct bch_fs *c)
 	accounting_mem_clear(acc);
 	cuckoo_exit(&acc->t);
 }
+
+/*
+ * How full the mem table is actually running.
+ *
+ * cuckoo_too_full() grows at 50%, so a healthy table sits between 25% (just
+ * grown, so half the slots of a table twice as big) and 50% (about to grow).
+ * Well below 25% means we grew for some reason other than load - an insert that
+ * ran out of kicks - and sitting at 50% means we aren't growing when we should.
+ */
+void bch2_accounting_mem_table_to_text(struct printbuf *out, struct bch_fs *c)
+{
+	struct bch_accounting_mem *acc = &c->accounting;
+
+	guard(percpu_read_noio)(&c->capacity.mark_lock);
+
+	size_t slots = acc->t.slots ? acc->t.mask + 1 : 0;
+
+	printbuf_tabstop_push(out, 16);
+
+	prt_printf(out, "entries\t%zu\n", acc->t.nr);
+	prt_printf(out, "slots\t%zu\n", slots);
+
+	prt_printf(out, "fill\t");
+	if (slots)
+		prt_printf(out, "%zu%%\n", acc->t.nr * 100 / slots);
+	else
+		prt_str(out, "-\n");
+
+	prt_printf(out, "memory\t");
+	prt_human_readable_s64(out, slots * sizeof(struct accounting_mem_entry));
+	prt_newline(out);
+}

@@ -199,6 +199,7 @@ read_attribute(errors);
 read_attribute(journal_debug);
 read_attribute(journal_reclaim);
 read_attribute(btree_cache);
+read_attribute(accounting_table);
 read_attribute(btree_key_cache);
 read_attribute(btree_reserve_cache);
 read_attribute(btree_write_buffer);
@@ -356,6 +357,9 @@ SHOW(bch2_fs)
 
 	if (attr == &sysfs_journal_reclaim)
 		bch2_journal_reclaim_to_text(out, &c->journal);
+
+	if (attr == &sysfs_accounting_table)
+		bch2_accounting_mem_table_to_text(out, c);
 
 	if (attr == &sysfs_btree_cache)
 		bch2_btree_cache_to_text(out, &c->btree.cache);
@@ -623,6 +627,7 @@ struct attribute *bch2_fs_internal_files[] = {
 	&sysfs_journal_debug,
 	&sysfs_journal_reclaim,
 	&sysfs_btree_cache,
+	&sysfs_accounting_table,
 	&sysfs_btree_key_cache,
 	&sysfs_btree_reserve_cache,
 	&sysfs_btree_write_buffer,
