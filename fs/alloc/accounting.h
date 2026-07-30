@@ -160,7 +160,7 @@ static const struct cuckoo_ops accounting_cuckoo_ops = {
 	.entry_size	= sizeof(struct accounting_mem_entry),
 	.key_offset	= offsetof(struct accounting_mem_entry, pos),
 	.key_size	= sizeof(struct bpos),
-	.hash		= cuckoo_siphash13,
+	.hash		= cuckoo_hash_bytes,
 	.entry_empty	= accounting_mem_entry_empty,
 };
 

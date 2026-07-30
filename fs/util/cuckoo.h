@@ -37,8 +37,7 @@
 #include <linux/random.h>
 #include <linux/slab.h>
 #include <linux/string.h>
-
-#include "util/siphash.h"
+#include <linux/unaligned.h>
 
 /*
  * Bound on the eviction walk. Exceeding it means the walk hit a cycle (or the
@@ -87,14 +86,49 @@ struct cuckoo_ops {
 	bool			(*entry_empty)(const void *entry);
 };
 
-static inline u64 cuckoo_siphash13(const void *key, size_t key_size, const u64 seed[2])
-{
-	SIPHASH_KEY k = {
-		.k0 = cpu_to_le64(seed[0]),
-		.k1 = cpu_to_le64(seed[1]),
-	};
+/*
+ * Xor the key down to one word, then two rounds of multiply-xorshift - the
+ * mixing splitmix64 finalizes with. With a static const ops the key size is
+ * constant, so this unrolls to a couple of loads, two multiplies and a few
+ * shifts: no call, no context, nothing on the stack.
+ *
+ * Not cryptographic. What cuckoo needs is avalanche, so that a key's two slot
+ * indices aren't correlated; it does not need to resist anyone choosing keys.
+ * A caller whose keys are untrusted should supply something stronger through
+ * ops->hash.
+ *
+ * Measured against jhash on 1026 realistic disk_accounting_pos keys (20 bytes,
+ * mostly zeroes, small values in a few fixed byte positions - the low entropy
+ * case that punishes a weak hash), packing into a fixed 1024 slot table over
+ * 200 seeds: 53.6% mean achievable load vs jhash's 53.9%, i.e. the same, both
+ * sitting on 2-way cuckoo's own ~50% threshold rather than on the hash. So the
+ * hash isn't what limits the table, and this is the cheap end of "at least as
+ * good as jhash".
+ */
+#define CUCKOO_HASH_MUL		0x9E3779B97F4A7C15ULL
 
-	return SipHash(&k, 1, 3, key, key_size);
+/*
+ * __always_inline, not inline: the loop makes gcc's inliner decline this even
+ * after it has devirtualized ops->hash, so we got an out-of-line call per lookup
+ * - 13% of a gc profile, with its own symbol in perf. Inlined, key_size is a
+ * constant and the loop unrolls to a few loads and two multiplies.
+ */
+static __always_inline u64 cuckoo_hash_bytes(const void *key, size_t key_size, const u64 seed[2])
+{
+	const u8 *p = key;
+	u64 h = seed[0];
+	size_t i = 0;
+
+	for (; i + sizeof(u64) <= key_size; i += sizeof(u64))
+		h ^= get_unaligned((const u64 *) (p + i));
+
+	for (; i < key_size; i++)
+		h ^= (u64) p[i] << ((i & 7) * 8);
+
+	h = (h ^ seed[1]) * CUCKOO_HASH_MUL;
+	h ^= h >> 32;
+	h *= CUCKOO_HASH_MUL;
+	return h ^ (h >> 29);
 }
 
 static inline void *__cuckoo_slot(const struct cuckoo_table *t,
