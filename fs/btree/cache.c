@@ -1908,3 +1908,171 @@ __cold void bch2_btree_cache_to_text(struct printbuf *out, const struct bch_fs_b
 		prt_printf(out, "  %s\t%llu\n",
 			   bch2_btree_cache_not_freed_reasons_strs[i], bc->not_freed[i]);
 }
+
+/* ------------------------------------------------------------------------
+ * DEBUG ONLY — btree node pin decay census.
+ *
+ * Experiment for koverstreet/bcachefs-tools#646: Kent's claim is that pinning
+ * btree nodes by node identity (as the "armoured" swap patchset did, via
+ * set_btree_node_noevict() on the node set that exists at swapon time) goes
+ * stale under COW, because every btree update replaces nodes and the
+ * replacements are not pinned.
+ *
+ * This measures that.  Enabled by setting BCH_PIN_CENSUS=1 in the environment
+ * (userspace builds only).  At fs start we walk every btree's leaf level,
+ * set BTREE_NODE_noevict on each node, and record its hash_val (which is
+ * btree_ptr_hash_val() — the *physical* pointer, so a COW replacement of the
+ * same logical position gets a different one).  At fs stop we walk again and
+ * report how much of the recorded set survived, and how much of the live leaf
+ * set is still pinned.
+ *
+ * NOT FOR UPSTREAM.
+ * ------------------------------------------------------------------------ */
+
+#define PIN_CENSUS_MAX	(1U << 20)
+
+struct pin_census_ent {
+	u64		hash_val;
+	u8		btree_id;
+};
+
+static struct pin_census_ent	*pin_census;
+static unsigned			pin_census_nr;
+static u64			pin_census_marked[BTREE_ID_NR];
+
+static int pin_census_cmp(const void *_l, const void *_r)
+{
+	const struct pin_census_ent *l = _l, *r = _r;
+
+	return l->hash_val < r->hash_val ? -1 : l->hash_val > r->hash_val ? 1 : 0;
+}
+
+static bool pin_census_has(u64 hash_val)
+{
+	unsigned lo = 0, hi = pin_census_nr;
+
+	while (lo < hi) {
+		unsigned mid = lo + (hi - lo) / 2;
+
+		if (pin_census[mid].hash_val == hash_val)
+			return true;
+		if (pin_census[mid].hash_val < hash_val)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return false;
+}
+
+/*
+ * mode 1: pin by node identity (what the armoured swap patchset did --
+ *         set_btree_node_noevict() on the struct btree instances that exist now)
+ * mode 2: pin by position (bc->pinned_nodes_start/end, what journal replay and
+ *         backpointers use -- BTREE_NODE_pinned is re-derived from position on
+ *         every un-hashed -> hashed transition, see the mod_bit() above)
+ */
+static int pin_census_mode = 1;
+
+void bch2_pin_census_start(struct bch_fs *c)
+{
+	if (pin_census)
+		return;
+
+	const char *m = getenv("BCH_PIN_CENSUS");
+	if (m && m[0] == '2')
+		pin_census_mode = 2;
+
+	pin_census = kvmalloc_array(PIN_CENSUS_MAX, sizeof(*pin_census), GFP_KERNEL);
+	if (!pin_census)
+		return;
+
+	struct bch_fs_btree_cache *bc = &c->btree.cache;
+
+	if (pin_census_mode == 2)
+		scoped_guard(mutex_noio, &bc->lock) {
+			bc->pinned_nodes_mask[0]	= ~0ULL;	/* leaves */
+			bc->pinned_nodes_mask[1]	= 0;
+			bc->pinned_nodes_start		= BBPOS_MIN;
+			bc->pinned_nodes_end		= BBPOS_MAX;
+		}
+
+	CLASS(btree_trans, trans)(c);
+
+	for (unsigned btree = 0; btree < btree_id_nr_alive(c); btree++) {
+		if (!bch2_btree_id_root(c, btree)->b)
+			continue;
+
+		int ret = for_each_btree_node(trans, iter, btree, POS_MIN, 0,
+					      BTREE_ITER_prefetch, b, ({
+			if (pin_census_nr < PIN_CENSUS_MAX && b->hash_val) {
+				if (pin_census_mode == 2)
+					bch2_node_pin(c, b);
+				else
+					set_btree_node_noevict(b);
+				pin_census[pin_census_nr].hash_val = b->hash_val;
+				pin_census[pin_census_nr].btree_id = btree;
+				pin_census_nr++;
+				pin_census_marked[btree]++;
+			}
+			0;
+		}));
+		if (ret)
+			printk(KERN_INFO "pin census: btree %u walk error %i\n", btree, ret);
+	}
+
+	sort(pin_census, pin_census_nr, sizeof(*pin_census), pin_census_cmp, NULL);
+
+	printk(KERN_INFO "pin census: START mode %u, pinned %u leaf nodes\n",
+	       pin_census_mode, pin_census_nr);
+	for (unsigned i = 0; i < BTREE_ID_NR; i++)
+		if (pin_census_marked[i])
+			printk(KERN_INFO "pin census:   btree %u: %llu\n", i, pin_census_marked[i]);
+}
+
+void bch2_pin_census_report(struct bch_fs *c)
+{
+	if (!pin_census)
+		return;
+
+	u64 live[BTREE_ID_NR] = {}, survived[BTREE_ID_NR] = {}, pinned_now[BTREE_ID_NR] = {};
+	u64 live_tot = 0, surv_tot = 0, pinned_tot = 0;
+
+	CLASS(btree_trans, trans)(c);
+
+	for (unsigned btree = 0; btree < btree_id_nr_alive(c); btree++) {
+		if (!bch2_btree_id_root(c, btree)->b)
+			continue;
+
+		int ret = for_each_btree_node(trans, iter, btree, POS_MIN, 0,
+					      BTREE_ITER_prefetch, b, ({
+			live[btree]++;
+			if (pin_census_has(b->hash_val))
+				survived[btree]++;
+			if (pin_census_mode == 2
+			    ? btree_node_pinned(b)
+			    : btree_node_noevict(b))
+				pinned_now[btree]++;
+			0;
+		}));
+		if (ret)
+			printk(KERN_INFO "pin census: btree %u re-walk error %i\n", btree, ret);
+	}
+
+	printk(KERN_INFO "pin census: REPORT\n");
+	printk(KERN_INFO "pin census: btree  pinned_t0  live_t1  survived  still_noevict\n");
+	for (unsigned i = 0; i < BTREE_ID_NR; i++) {
+		if (!pin_census_marked[i] && !live[i])
+			continue;
+		printk(KERN_INFO "pin census: %5u  %9llu  %7llu  %8llu  %13llu\n",
+		       i, pin_census_marked[i], live[i], survived[i], pinned_now[i]);
+		live_tot	+= live[i];
+		surv_tot	+= survived[i];
+		pinned_tot	+= pinned_now[i];
+	}
+	printk(KERN_INFO "pin census: TOTAL  %9u  %7llu  %8llu  %13llu\n",
+	       pin_census_nr, live_tot, surv_tot, pinned_tot);
+
+	kvfree(pin_census);
+	pin_census = NULL;
+	pin_census_nr = 0;
+}

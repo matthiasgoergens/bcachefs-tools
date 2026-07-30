@@ -15,6 +15,7 @@
 #include "alloc/foreground.h"
 #include "alloc/replicas.h"
 
+#include "btree/cache.h"
 #include "btree/check.h"
 #include "btree/journal_overlay.h"
 #include "btree/init.h"
@@ -721,6 +722,12 @@ static void bch2_fs_release(struct kobject *kobj)
 
 int bch2_fs_stop(struct bch_fs *c)
 {
+#ifndef __KERNEL__
+	/* DEBUG ONLY — btree node pin decay census. Not for upstream. */
+	if (getenv("BCH_PIN_CENSUS"))
+		bch2_pin_census_report(c);
+#endif
+
 	if (!test_and_set_bit(BCH_FS_stopping, &c->flags)) {
 		if (test_bit(BCH_FS_started, &c->flags))
 			bch_verbose(c, "shutting down");
@@ -1528,6 +1535,12 @@ int bch2_fs_start(struct bch_fs *c)
 	if (err.pos != pos)
 		bch2_print_str(c, KERN_ERR, err.buf);
 
+#ifndef __KERNEL__
+	/* DEBUG ONLY — btree node pin decay census. Not for upstream. */
+	if (!ret && getenv("BCH_PIN_CENSUS"))
+		bch2_pin_census_start(c);
+#endif
+
 	return ret;
 }
 
@@ -1688,6 +1701,12 @@ static struct bch_fs *__bch2_fs_open(darray_const_str *devices,
 		c->recovery_task = NULL;
 		if (ret)
 			goto err;
+
+#ifndef __KERNEL__
+		/* DEBUG ONLY — btree node pin decay census. Not for upstream. */
+		if (getenv("BCH_PIN_CENSUS"))
+			bch2_pin_census_start(c);
+#endif
 	}
 out:
 	darray_for_each(sbs, sb)

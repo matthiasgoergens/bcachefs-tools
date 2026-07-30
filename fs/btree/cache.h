@@ -303,6 +303,10 @@ void bch2_btree_pos_to_text(struct printbuf *, struct bch_fs *, const struct btr
 void bch2_btree_node_to_text(struct printbuf *, struct bch_fs *, const struct btree *);
 void bch2_btree_cache_to_text(struct printbuf *, const struct bch_fs_btree_cache *);
 
+/* DEBUG ONLY — btree node pin decay census, see cache.c. Not for upstream. */
+void bch2_pin_census_start(struct bch_fs *);
+void bch2_pin_census_report(struct bch_fs *);
+
 #define trace_btree_node(_c, _b, event)				\
 	event_inc_trace(c, event, buf, bch2_btree_pos_to_text(&buf, c, b))
 
