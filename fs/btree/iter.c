@@ -3746,6 +3746,171 @@ static void __bch2_trans_begin_trace(struct btree_trans *trans)
 	}));
 }
 
+/*
+ * Instrumentation for the bch2_trans_begin() lock-hold-time yield.
+ *
+ * Userspace only, and inert unless BCACHEFS_YIELD_STATS=1 is set in the
+ * environment. It exists to answer one question with measurement rather than
+ * code reading: at the point bch2_trans_begin() decides whether to drop btree
+ * locks, how often is the *pre-fix* deadline expression true, how often is the
+ * *post-fix* one true, and how long had the locked section actually been
+ * running?
+ *
+ * Both expressions are evaluated on every check so a single binary can measure
+ * both; BCACHEFS_YIELD_OLD=1 additionally makes the pre-fix expression the one
+ * that actually drives the yield, so the two arms differ at runtime only.
+ *
+ * need_resched() is #define'd to 0 in the userspace shims
+ * (include/linux/sched.h), so in this build the deadline expression is the sole
+ * possible trigger — which is exactly what makes the measurement decisive.
+ */
+#ifndef __KERNEL__
+
+#include <stdlib.h>
+
+bool bch2_yield_use_old_cond;
+static bool bch2_yield_stats_enabled;
+
+#define YIELD_HIST_BUCKETS	24
+
+static struct bch2_yield_stats {
+	u64	checked;
+	u64	restarted;
+	u64	old_cond_true;
+	u64	new_cond_true;
+	u64	yielded;
+	/*
+	 * Checks that found last_yield_time already cleared. trans_begin arms
+	 * it, but bch2_trans_unlock_long() (the srcu-held-too-long path) runs
+	 * between the arming and the check and clears it again, so the
+	 * post-fix expression compares against 0 and is trivially true.
+	 */
+	u64	zero_armed;
+	u64	max_age_ns;
+	u64	sum_age_ns;
+	/* log2(age in ns), so bucket 20 is ~1ms, bucket 30 is ~1s */
+	u64	age_hist[YIELD_HIST_BUCKETS];
+} yield_stats;
+
+u64 bch2_yield_fine_clock(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ((u64) ts.tv_sec * NSEC_PER_SEC) + ts.tv_nsec;
+}
+
+static inline void yield_add(u64 *p, u64 v)
+{
+	__atomic_fetch_add(p, v, __ATOMIC_RELAXED);
+}
+
+/* Arm the fine-grained shadow wherever last_yield_time itself is armed. */
+static void yield_arm_fine(struct btree_trans *trans)
+{
+	if (bch2_yield_stats_enabled && !trans->last_yield_time_fine)
+		trans->last_yield_time_fine = bch2_yield_fine_clock();
+}
+
+static void yield_rearm_fine(struct btree_trans *trans)
+{
+	if (bch2_yield_stats_enabled)
+		trans->last_yield_time_fine = bch2_yield_fine_clock();
+}
+
+static u64 yield_section_age(struct btree_trans *trans)
+{
+	return trans->last_yield_time_fine
+		? bch2_yield_fine_clock() - trans->last_yield_time_fine
+		: 0;
+}
+
+static void bch2_yield_stat_restarted(void)
+{
+	if (bch2_yield_stats_enabled)
+		yield_add(&yield_stats.restarted, 1);
+}
+
+static void bch2_yield_stat_yielded(void)
+{
+	if (bch2_yield_stats_enabled)
+		yield_add(&yield_stats.yielded, 1);
+}
+
+static void bch2_yield_stat_check(u64 age_ns, bool armed, bool old_cond, bool new_cond)
+{
+	if (!bch2_yield_stats_enabled)
+		return;
+
+	yield_add(&yield_stats.checked, 1);
+	if (!armed) {
+		yield_add(&yield_stats.zero_armed, 1);
+		return;
+	}
+
+	yield_add(&yield_stats.sum_age_ns, age_ns);
+	if (old_cond)
+		yield_add(&yield_stats.old_cond_true, 1);
+	if (new_cond)
+		yield_add(&yield_stats.new_cond_true, 1);
+
+	unsigned bucket = age_ns ? ilog2(age_ns) : 0;
+	if (bucket >= YIELD_HIST_BUCKETS)
+		bucket = YIELD_HIST_BUCKETS - 1;
+	yield_add(&yield_stats.age_hist[bucket], 1);
+
+	u64 max = __atomic_load_n(&yield_stats.max_age_ns, __ATOMIC_RELAXED);
+	while (age_ns > max &&
+	       !__atomic_compare_exchange_n(&yield_stats.max_age_ns, &max, age_ns,
+					    true, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+		;
+}
+
+__attribute__((constructor))
+static void bch2_yield_stats_init(void)
+{
+	const char *e = getenv("BCACHEFS_YIELD_STATS");
+	bch2_yield_stats_enabled = e && !strcmp(e, "1");
+
+	e = getenv("BCACHEFS_YIELD_OLD");
+	bch2_yield_use_old_cond = e && !strcmp(e, "1");
+}
+
+__attribute__((destructor))
+static void bch2_yield_stats_exit(void)
+{
+	if (!bch2_yield_stats_enabled)
+		return;
+
+	fprintf(stderr, "YIELDSTATS mode=%s checked=%llu restarted=%llu "
+		"zero_armed=%llu old_cond_true=%llu new_cond_true=%llu "
+		"yielded=%llu max_age_ns=%llu sum_age_ns=%llu\n",
+		bch2_yield_use_old_cond ? "old" : "new",
+		yield_stats.checked, yield_stats.restarted,
+		yield_stats.zero_armed,
+		yield_stats.old_cond_true, yield_stats.new_cond_true,
+		yield_stats.yielded,
+		yield_stats.max_age_ns, yield_stats.sum_age_ns);
+
+	for (unsigned i = 0; i < YIELD_HIST_BUCKETS; i++)
+		if (yield_stats.age_hist[i])
+			fprintf(stderr, "YIELDHIST 2^%u ns (%s) %llu\n", i,
+				i >= 20 ? ">=1ms" : "<1ms",
+				yield_stats.age_hist[i]);
+}
+
+#else /* __KERNEL__ */
+
+#define bch2_yield_use_old_cond			false
+static inline void bch2_yield_stat_restarted(void) {}
+static inline void bch2_yield_stat_yielded(void) {}
+static inline void bch2_yield_stat_check(u64 age_ns, bool armed, bool old_cond, bool new_cond) {}
+static inline void yield_arm_fine(struct btree_trans *trans) {}
+static inline void yield_rearm_fine(struct btree_trans *trans) {}
+static inline u64 yield_section_age(struct btree_trans *trans) { return 0; }
+
+#endif
+
 /**
  * bch2_trans_begin() - reset a transaction after a interrupted attempt
  * @trans: transaction to reset
@@ -3859,6 +4024,7 @@ u32 bch2_trans_begin(struct btree_trans *trans)
 	 */
 	if (!trans->last_yield_time)
 		trans->last_yield_time = now;
+	yield_arm_fine(trans);
 
 	/* Fresh attempt — re-arm the srcu-held-too-long warning (cleared after
 	 * the unlock_long above has had its chance to fire). */
@@ -3886,13 +4052,30 @@ u32 bch2_trans_begin(struct btree_trans *trans)
 		/* restart is hot — skip the resched check */
 		bch2_btree_path_traverse_all(trans);
 		trans->notrace_relock_fail = false;
-	} else if (need_resched() ||
-		   time_after64(now, trans->last_yield_time +
-				BTREE_TRANS_MAX_LOCK_HOLD_TIME_NS)) {
-		bch2_trans_unlock(trans);
-		cond_resched();
-		now = local_clock();
-		trans->last_yield_time = now;
+		bch2_yield_stat_restarted();
+	} else {
+		/*
+		 * The pre-fix expression, kept here only so the instrumented
+		 * userspace build can count how often it *would* have fired.
+		 * trans_start_time was assigned `now` a few lines up on this
+		 * same !restarted path, so this is time_after64(now, now + 1ms).
+		 */
+		bool old_cond = time_after64(now, trans->locking_wait.trans_start_time +
+					     BTREE_TRANS_MAX_LOCK_HOLD_TIME_NS);
+		bool new_cond = time_after64(now, trans->last_yield_time +
+					     BTREE_TRANS_MAX_LOCK_HOLD_TIME_NS);
+		bool armed = trans->last_yield_time != 0;
+
+		bch2_yield_stat_check(yield_section_age(trans), armed, old_cond, new_cond);
+
+		if (need_resched() || (bch2_yield_use_old_cond ? old_cond : new_cond)) {
+			bch2_trans_unlock(trans);
+			cond_resched();
+			now = local_clock();
+			trans->last_yield_time = now;
+			yield_rearm_fine(trans);
+			bch2_yield_stat_yielded();
+		}
 	}
 
 	trans_set_locked(trans, false);

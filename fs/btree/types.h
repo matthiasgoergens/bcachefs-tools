@@ -719,6 +719,17 @@ struct btree_trans {
 	 * trans_set_unlocked(), i.e. only when locks are genuinely dropped.
 	 */
 	u64			last_yield_time;
+#ifndef __KERNEL__
+	/*
+	 * Instrumentation only. Userspace local_clock() is
+	 * CLOCK_MONOTONIC_COARSE, whose 1ms granularity equals
+	 * BTREE_TRANS_MAX_LOCK_HOLD_TIME_NS, so it cannot resolve how long a
+	 * locked section really ran. This shadows last_yield_time with a
+	 * CLOCK_MONOTONIC reading, purely to report the true distribution; it
+	 * never feeds the yield decision.
+	 */
+	u64			last_yield_time_fine;
+#endif
 	unsigned long		last_begin_ip;
 	unsigned long		last_restarted_ip;
 #ifdef CONFIG_BCACHEFS_DEBUG
