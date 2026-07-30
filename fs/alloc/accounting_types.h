@@ -6,7 +6,6 @@
 
 struct accounting_mem_entry {
 	struct bpos				pos;
-	struct bversion				bversion;
 	unsigned				nr_counters;
 	/*
 	 * Normal and gc counters. v[0] doubles as the hash table's
