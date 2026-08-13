@@ -208,7 +208,10 @@ static bool demote_flip_try(struct bch_fs *c, struct demote_flip *f)
 			bkey_start_pos(&f->k.k->k),
 			BTREE_ITER_slots|BTREE_ITER_intent,
 			k, &res.r, NULL, 0, ({
-		if (bkey_le(f->k.k->k.p, bkey_start_pos(k.k)))
+		/* walk the published key's range; break only past it - the
+		 * key AT the published pos is the match candidate (le broke
+		 * on equality and every flip dropped, measured) */
+		if (bkey_lt(f->k.k->k.p, bkey_start_pos(k.k)))
 			break;
 
 		/* exact revalidation: the published key must be untouched

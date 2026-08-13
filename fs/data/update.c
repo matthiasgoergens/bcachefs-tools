@@ -404,7 +404,15 @@ static int data_update_index_update_key(struct btree_trans *trans,
 
 	try(bch2_bkey_drop_extra_durability(trans, &opts,	insert, ~0, false));
 
-	bch2_bkey_drop_extra_cached_ptrs(c, &opts, bkey_i_to_s(insert));
+	/*
+	 * flip-demote: the cached leg on the background target is the
+	 * whole point - the generic extra-cached drop would remove it
+	 * ("incorrect target": it is not in the promote/foreground
+	 * target). The flip, or the reconcile cached cleanup after a
+	 * lost flip, owns its lifetime instead.
+	 */
+	if (!u->flip_ptrs_kill)
+		bch2_bkey_drop_extra_cached_ptrs(c, &opts, bkey_i_to_s(insert));
 
 	bch2_bkey_propagate_incompressible(c, insert, k);
 
