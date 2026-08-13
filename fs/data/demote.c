@@ -93,6 +93,7 @@ void bch2_demote_flip_arm(struct data_update *u)
 	 * No leg present means a race already changed the key - skip.
 	 */
 	bool have_leg = false;
+	struct bkey_s_c peeked = {};
 	{
 		CLASS(btree_trans, trans)(c);
 		CLASS(btree_iter, iter)(trans, u->btree_id,
@@ -100,6 +101,7 @@ void bch2_demote_flip_arm(struct data_update *u)
 					BTREE_ITER_slots);
 		struct bkey_s_c k = bch2_btree_iter_peek_slot(&iter);
 
+		peeked = k;
 		if (k.k) {
 			bch2_bkey_buf_reassemble(&f->k, k);
 

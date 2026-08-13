@@ -434,6 +434,21 @@ static int reconcile_set_data_opts(struct btree_trans *trans,
 		return 0;
 
 	/*
+	 * Another data update is already in flight for this exact key
+	 * (the update table excludes nothing by default - measured: the
+	 * logical and physical reconcile workers start updates on the
+	 * same extent, each update then loses the extents_match check
+	 * and discards, so the demote leg never lands and the extent is
+	 * re-demoted forever). Restart: by the retry the other update
+	 * has finished and removed itself from the table.
+	 */
+	if (bch2_data_update_in_flight(c, &(struct bbpos) {
+					.btree = iter->btree_id,
+					.pos = k.k->p },
+				     BCH_DATA_UPDATE_reconcile))
+		return bch_err_throw(c, transaction_restart);
+
+	/*
 	 * A cached-leg demote flip is pending for this exact key: the flip
 	 * owns the transition and recomputes reconcile state when it
 	 * commits. Processing now would rewrite the key and abort the
