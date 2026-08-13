@@ -18,6 +18,7 @@
 #include "data/ec/create.h"
 #include "data/ec/trigger.h"
 #include "data/move.h"
+#include "data/demote.h"
 #include "data/reconcile/work.h"
 #include "data/write.h"
 
@@ -430,6 +431,24 @@ static int reconcile_set_data_opts(struct btree_trans *trans,
 	struct bch_fs *c = trans->c;
 	const struct bch_extent_reconcile *r = bch2_bkey_reconcile_opts(c, k);
 	if (!r || !r->need_rb) /* Write buffer race? */
+		return 0;
+
+	/*
+	 * A cached-leg demote flip is pending for this exact key: the flip
+	 * owns the transition and recomputes reconcile state when it
+	 * commits. Processing now would rewrite the key and abort the
+	 * flip's exact-match revalidation - and re-demote this extent in a
+	 * loop that starves the flip of a commit window (measured: 500+
+	 * flip writes in 900s with zero commits). Skip it without touching
+	 * the key: a restart here would spin and keep hammering the same
+	 * btree paths the flip's transaction needs, which is the same
+	 * starvation in a different shape (measured again). The durable
+	 * entry stays; when the flip commits or drops, a later pass
+	 * recomputes nothing-to-do or re-runs the demote.
+	 */
+	if (bch2_demote_flip_pending(c, (struct bbpos) {
+					.btree = iter->btree_id,
+					.pos = k.k->p }))
 		return 0;
 
 	data_opts->type			= BCH_DATA_UPDATE_reconcile;

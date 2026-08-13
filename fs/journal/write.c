@@ -529,9 +529,15 @@ static CLOSURE_CALLBACK(journal_write_done_flush)
 		 * completion generation. Debt registrations waiting for
 		 * completed_gen >= ticket + 1 are released (bch2_journal_debt_add()).
 		 */
-		for_each_set_bit(dev, w->flush_devs.d, BCH_SB_MEMBERS_MAX)
+		for_each_set_bit(dev, w->flush_devs.d, BCH_SB_MEMBERS_MAX) {
 			smp_store_release(&c->journal_completed_gen[dev],
 					  w->exchange_gen);
+			if (IS_ENABLED(CONFIG_BCACHEFS_DEBUG)) {
+				CLASS(bch_log_msg_ratelimited, msg)(c);
+				prt_printf(&msg.m, "debt advance: dev %u completed %llu\n",
+					   dev, w->exchange_gen);
+			}
+		}
 
 		bch2_demote_flip_wake(c);
 	} else {

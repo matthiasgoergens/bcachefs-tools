@@ -46,6 +46,7 @@ struct demote_flip {
 	struct bch_devs_mask	devs;		/* cached-leg devices to un-cache */
 	u64			ticket[BCH_SB_MEMBERS_MAX];
 	unsigned		flip_ptrs_kill;
+	bool			updated;	/* the try queued an update */
 };
 
 static void demote_flip_free(struct demote_flip *f)
@@ -66,6 +67,12 @@ void bch2_demote_flip_arm(struct data_update *u)
 
 	if (!u->flip_ptrs_kill || !u->op.written)
 		return;
+
+	if (IS_ENABLED(CONFIG_BCACHEFS_DEBUG)) {
+		CLASS(bch_log_msg_ratelimited, msg)(c);
+		prt_printf(&msg.m, "demote flip: armed %llu:%llu kill 0x%x\n",
+			   u->k.k->k.p.inode, u->k.k->k.p.offset, u->flip_ptrs_kill);
+	}
 
 	f = kzalloc(sizeof(*f), GFP_KERNEL);
 	if (!f)
@@ -138,6 +145,25 @@ void bch2_demote_flip_wake(struct bch_fs *c)
 		mod_delayed_work(system_unbound_wq, &c->demote_flip_work, 0);
 }
 
+bool bch2_demote_flip_pending(struct bch_fs *c, struct bbpos pos)
+{
+	struct demote_flip *f;
+	bool ret = false;
+
+	spin_lock(&c->demote_flips_lock);
+	list_for_each_entry(f, &c->demote_flips, list)
+		if (f->pos.btree == pos.btree &&
+		    f->pos.pos.inode == pos.pos.inode &&
+		    f->pos.pos.offset == pos.pos.offset &&
+		    f->pos.pos.snapshot == pos.pos.snapshot) {
+			ret = true;
+			break;
+		}
+	spin_unlock(&c->demote_flips_lock);
+
+	return ret;
+}
+
 static bool demote_flip_covered(struct bch_fs *c, struct demote_flip *f)
 {
 	unsigned dev;
@@ -173,6 +199,8 @@ static bool demote_flip_try(struct bch_fs *c, struct demote_flip *f)
 		    memcmp(k.k, &f->k.k->k, bkey_bytes(k.k)))
 			continue;
 
+		f->updated = true;
+
 		struct bkey_i *new = errptr_try(bch2_bkey_make_mut_noupdate(trans, k));
 		struct bkey_ptrs ptrs = bch2_bkey_ptrs(bkey_i_to_s(new));
 		struct bch_extent_ptr *ptr;
@@ -189,8 +217,21 @@ static bool demote_flip_try(struct bch_fs *c, struct demote_flip *f)
 		bch2_trans_update(trans, &iter, new, 0);
 	}));
 
+	if (ret && IS_ENABLED(CONFIG_BCACHEFS_DEBUG)) {
+		CLASS(bch_log_msg_ratelimited, msg)(c);
+		prt_printf(&msg.m, "demote flip: try failed %llu:%llu ret %s\n",
+			   f->k.k->k.p.inode, f->k.k->k.p.offset, bch2_err_str(ret));
+	}
+
 	if (bch2_err_matches(ret, BCH_ERR_transaction_restart))
 		return false;
+
+	if (!ret && IS_ENABLED(CONFIG_BCACHEFS_DEBUG)) {
+		CLASS(bch_log_msg_ratelimited, msg)(c);
+		prt_printf(&msg.m, "demote flip: %s %llu:%llu kill 0x%x\n",
+			   f->updated ? "committed" : "dropped (key not found)",
+			   f->k.k->k.p.inode, f->k.k->k.p.offset, f->flip_ptrs_kill);
+	}
 
 	return true;
 }
@@ -209,24 +250,25 @@ static void demote_flip_work_fn(struct work_struct *work)
 			continue;
 		}
 
-		list_del(&f->list);
-		c->demote_flips_pending--;
+		/*
+		 * Try with the flip still on the list: the reconcile path
+		 * uses list membership as its exclusion, so removing
+		 * before the flip's transaction would open a window for
+		 * the mover to rewrite the key under it. A restart leaves
+		 * it in place for the next pass.
+		 */
 		spin_unlock(&c->demote_flips_lock);
 
-		/* retry later on transaction restart */
 		if (!demote_flip_try(c, f)) {
-			spin_lock(&c->demote_flips_lock);
-			if (c->demote_flips_pending < DEMOTE_FLIPS_MAX) {
-				c->demote_flips_pending++;
-				list_add_tail(&f->list, &c->demote_flips);
-			} else {
-				demote_flip_free(f);
-			}
 			again = true;
-			continue;
+		} else {
+			spin_lock(&c->demote_flips_lock);
+			list_del(&f->list);
+			c->demote_flips_pending--;
+			spin_unlock(&c->demote_flips_lock);
+			demote_flip_free(f);
 		}
 
-		demote_flip_free(f);
 		spin_lock(&c->demote_flips_lock);
 	}
 	spin_unlock(&c->demote_flips_lock);

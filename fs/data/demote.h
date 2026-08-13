@@ -25,5 +25,6 @@ bool bch2_demote_flip_room(struct bch_fs *);
 void bch2_demote_flip_wake(struct bch_fs *);
 int bch2_demote_flip_init(struct bch_fs *);
 void bch2_demote_flip_exit(struct bch_fs *);
+bool bch2_demote_flip_pending(struct bch_fs *, struct bbpos);
 
 #endif /* _BCACHEFS_DATA_DEMOTE_H */
