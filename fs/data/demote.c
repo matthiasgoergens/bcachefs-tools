@@ -70,8 +70,9 @@ void bch2_demote_flip_arm(struct data_update *u)
 
 	if (IS_ENABLED(CONFIG_BCACHEFS_DEBUG)) {
 		CLASS(bch_log_msg_ratelimited, msg)(c);
-		prt_printf(&msg.m, "demote flip: armed %llu:%llu kill 0x%x\n",
-			   u->k.k->k.p.inode, u->k.k->k.p.offset, u->flip_ptrs_kill);
+		prt_printf(&msg.m, "demote flip: armed %llu:%llu:%u kill 0x%x\n",
+			   u->k.k->k.p.inode, u->k.k->k.p.offset,
+			   u->k.k->k.p.snapshot, u->flip_ptrs_kill);
 	}
 
 	f = kzalloc(sizeof(*f), GFP_KERNEL);
@@ -114,6 +115,12 @@ void bch2_demote_flip_arm(struct data_update *u)
 		}
 	}
 	if (!have_leg) {
+		if (IS_ENABLED(CONFIG_BCACHEFS_DEBUG)) {
+			CLASS(bch_log_msg_ratelimited, msg)(c);
+			prt_printf(&msg.m, "demote flip: no leg at %u:%llu:%llu:%u written_devs 0x%lx\n",
+				   u->btree_id, u->k.k->k.p.inode, u->k.k->k.p.offset,
+				   u->k.k->k.p.snapshot, u->op.written_devs.d[0]);
+		}
 		demote_flip_free(f);
 		return;
 	}
@@ -135,6 +142,13 @@ void bch2_demote_flip_arm(struct data_update *u)
 	c->demote_flips_pending++;
 	list_add_tail(&f->list, &c->demote_flips);
 	spin_unlock(&c->demote_flips_lock);
+
+	if (IS_ENABLED(CONFIG_BCACHEFS_DEBUG)) {
+		CLASS(bch_log_msg_ratelimited, msg)(c);
+		prt_printf(&msg.m, "demote flip: queued %u:%llu:%llu:%u (%u pending)\n",
+			   f->pos.btree, f->pos.pos.inode, f->pos.pos.offset,
+			   f->pos.pos.snapshot, c->demote_flips_pending);
+	}
 
 	mod_delayed_work(system_unbound_wq, &c->demote_flip_work, 0);
 }
@@ -160,6 +174,9 @@ bool bch2_demote_flip_pending(struct bch_fs *c, struct bbpos pos)
 			break;
 		}
 	spin_unlock(&c->demote_flips_lock);
+
+	if (ret && IS_ENABLED(CONFIG_BCACHEFS_DEBUG)) {
+	}
 
 	return ret;
 }
@@ -244,6 +261,9 @@ static void demote_flip_work_fn(struct work_struct *work)
 	bool again = false;
 
 	spin_lock(&c->demote_flips_lock);
+
+
+
 	list_for_each_entry_safe(f, n, &c->demote_flips, list) {
 		if (!demote_flip_covered(c, f)) {
 			again = true;

@@ -1461,6 +1461,20 @@ int bch2_data_update_init(struct btree_trans *trans,
 			m->flip_ptrs_kill	= m->opts.ptrs_kill;
 			m->opts.ptrs_kill	= 0;
 			m->opts.extra_replicas	= 1;
+
+			/*
+			 * The killed ptrs stay authoritative until the flip
+			 * caches them, so the extent keeps its full
+			 * durability until then: durability_keeping above
+			 * was computed with the original ptrs_kill and
+			 * counts nothing. Count everything as keeping -
+			 * the new leg must be written cached, or the flip's
+			 * have_leg check never finds it (the leg would be
+			 * authoritative), and nr_replicas below would also
+			 * over-allocate. Measured: every flip arm dropped
+			 * with "no leg", and the demote looped forever.
+			 */
+			durability_keeping = durability_total;
 			/* op.flags, not just write_flags: the flag was already
 			 * copied into op.flags above this point, and the
 			 * written ptr's cached bit comes from op.flags */
