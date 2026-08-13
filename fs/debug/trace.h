@@ -26,6 +26,7 @@ DECLARE_EVENT_CLASS(fs_str,
 #define BCH_NOCOUNTER_TRACEPOINTS()					\
 	x(accounting_mem_insert)					\
 	x(journal_entry_close)						\
+	x(journal_write_deps)						\
 	x(extent_trim_atomic)						\
 	x(path_downgrade)						\
 	x(btree_iter_peek_slot)						\
