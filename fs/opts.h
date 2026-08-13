@@ -350,6 +350,14 @@ enum fsck_err_opts {
 			"rebalance) with FUA, making them durable on\n"	\
 			"completion rather than relying on the journal's\n"\
 			"periodic cache flush")				\
+	x(demote_cached_leg,		u8,				\
+	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
+	  OPT_BOOL(),							\
+	  BCH2_NO_SB_OPT,		false,				\
+	  NULL,		"Stage 2: demotes to a non-foreground target are\n"\
+			"written as cached replicas and flipped authoritative\n"\
+			"only once their durability debt is discharged,\n"\
+			"keeping slow-target flushes off the fsync path")	\
 	x(journal_reclaim_delay,	u32,				\
 	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
 	  OPT_UINT(0, U32_MAX),						\

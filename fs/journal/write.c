@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "bcachefs.h"
+#include "data/demote.h"
 
 #include "alloc/discard.h"
 #include "alloc/disk_groups.h"
@@ -503,6 +504,8 @@ static CLOSURE_CALLBACK(journal_write_done_flush)
 {
 	closure_type(w, struct journal_buf, io);
 	struct journal *j = w->j;
+	struct bch_fs *c = container_of(j, struct bch_fs, journal);
+	unsigned dev;
 
 	/*
 	 * Wake up flush waiters early, if there wasn't an error:
@@ -516,6 +519,32 @@ static CLOSURE_CALLBACK(journal_write_done_flush)
 	if (!w->failed.nr && w->wait.list.first > JOURNAL_BUF_FLUSH_NO_WAIT) {
 		struct closure_waitlist	wait = {{ xchg(&w->wait.list.first, NULL) }};
 		closure_wake_up(&wait);
+	}
+
+	if (!w->failed.nr) {
+		/*
+		 * Stage-2 ticket plumbing: the dependency preflushes for the
+		 * devices in flush_devs completed successfully here (this
+		 * closure waits on them), so advance each covered device's
+		 * completion generation. Debt registrations waiting for
+		 * completed_gen >= ticket + 1 are released (bch2_journal_debt_add()).
+		 */
+		for_each_set_bit(dev, w->flush_devs.d, BCH_SB_MEMBERS_MAX)
+			smp_store_release(&c->journal_completed_gen[dev],
+					  w->exchange_gen);
+
+		bch2_demote_flip_wake(c);
+	} else {
+		/*
+		 * A dependency preflush that failed must not consume the
+		 * debt: restore the bits so the next flush covers those
+		 * devices again. Over-conservative - also restores on
+		 * journal-replica failures, which merely costs an extra
+		 * preflush round in an already-failing scenario. (The
+		 * separate-failure-mask refinement splits the two cases.)
+		 */
+		for_each_set_bit(dev, w->flush_devs.d, BCH_SB_MEMBERS_MAX)
+			set_bit(dev, c->journal_debt.d);
 	}
 
 	continue_at_nobarrier(cl, journal_write_done, j->wq);
@@ -962,6 +991,7 @@ CLOSURE_CALLBACK(bch2_journal_write)
 	struct journal *j = w->j;
 	struct bch_fs *c = container_of(j, struct bch_fs, journal);
 	unsigned nr_rw_members = dev_mask_nr(&c->allocator.rw_devs[BCH_DATA_free]);
+	unsigned dev;
 	int ret;
 
 	BUG_ON(!w->write_started);
@@ -1059,6 +1089,16 @@ CLOSURE_CALLBACK(bch2_journal_write)
 		continue_at_nobarrier(cl, journal_write_submit, NULL);
 	return;
 err:
+	/*
+	 * The flush-write pick exchanged the durability debt into
+	 * w->flush_devs, but this write is aborted before its dependency
+	 * preflushes were issued - restore the debt so the next flush
+	 * write covers it. A failed or abandoned preflush must not
+	 * consume the debt.
+	 */
+	for_each_set_bit(dev, w->flush_devs.d, BCH_SB_MEMBERS_MAX)
+		set_bit(dev, c->journal_debt.d);
+
 	if (1) {
 		CLASS(bch_log_msg, msg)(c);
 		msg.m.suppress = true; /* only print once, when we go ERO */
@@ -1071,6 +1111,9 @@ err:
 		bch2_fs_emergency_read_only(c, &msg.m);
 	}
 no_io:
+	for_each_set_bit(dev, w->flush_devs.d, BCH_SB_MEMBERS_MAX)
+		set_bit(dev, c->journal_debt.d);
+
 	{
 		unsigned ptr_idx = 0;
 		extent_for_each_ptr(bkey_i_to_s_extent(&w->key), ptr) {
@@ -1275,6 +1318,8 @@ void bch2_journal_do_writes_locked(struct journal *j)
 			 * this set feeds the validator until stage 3 narrows
 			 * journal_write_preflush() to it.
 			 */
+			w->exchange_gen = ++c->journal_exchange_gen;
+
 			for (unsigned i = 0; i < BITS_TO_LONGS(BCH_SB_MEMBERS_MAX); i++)
 				w->flush_devs.d[i] = xchg(&c->journal_debt.d[i], 0);
 

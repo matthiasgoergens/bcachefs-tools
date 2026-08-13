@@ -56,6 +56,11 @@ struct journal_buf {
 	 * goes to every rw member.
 	 */
 	struct bch_devs_mask	flush_devs;
+	/* Debt exchange generation captured at flush-pick time; advanced
+	 * into journal_completed_gen[dev] when this flush's preflushes
+	 * for dev complete successfully (stage 2 ticket plumbing):
+	 */
+	u64			exchange_gen;
 	/*
 	 * Dual-oracle validation (stage 1, shadow - see
 	 * bch2_journal_write_prep()):

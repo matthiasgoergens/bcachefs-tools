@@ -753,7 +753,24 @@ struct bch_fs {
 	 * goes to every rw member; this mask feeds the validator.
 	 */
 	struct bch_devs_mask	journal_debt;
+	/*
+	 * Durability-debt ticket plumbing (stage 2): one exchange generation,
+	 * incremented once per debt-exchange event under j->lock, plus
+	 * per-device completion generations advanced when a flush that
+	 * exchanged a device's debt completes with its preflushes successful.
+	 * A debt registration records the exchange generation after setting
+	 * its bit; it is covered once the device's completion generation
+	 * passes the ticket + 1 (see bch2_journal_debt_add()).
+	 */
+	u64			journal_exchange_gen;
+	u64			journal_completed_gen[BCH_SB_MEMBERS_MAX];
+	/* Stage-2 cached-leg demote flip queue (data/demote.c): */
+	spinlock_t		demote_flips_lock;
+	struct list_head	demote_flips;
+	unsigned		demote_flips_pending;
+	struct delayed_work	demote_flip_work;
 
+	/* Stage-2 cached-leg demote flip queue (data/demote.c): */
 	struct bch_opts		opts;
 	struct mutex		opt_change_lock;
 	u32			opt_change_cookie;
@@ -886,9 +903,32 @@ struct bch_fs {
  * before it was sealed, so debt set here always precedes the exchange
  * into journal_buf.flush_devs of the flush that covers it.
  */
-static inline void bch2_journal_debt_add(struct bch_fs *c, unsigned dev)
+static inline u64 bch2_journal_debt_add(struct bch_fs *c, unsigned dev)
 {
+	/*
+	 * Ticket protocol (read BEFORE the bit is set; smp_mb orders the
+	 * read before the set). Any exchange with gen >= ticket + 1 runs
+	 * after this registration, hence after the write's completion, so
+	 * its preflush covers the write; the exchange's xchg (a full
+	 * barrier) makes the gen increment visible before it can take the
+	 * bit. completed_gen >= ticket + 1 therefore releases exactly when
+	 * a covering exchange completes. An exchange that ran entirely
+	 * before the registration cannot advance completed_gen past the
+	 * ticket, because it either did not include the device or included
+	 * it only via other debt whose preflush also covered this write.
+	 */
+	u64 ticket = READ_ONCE(c->journal_exchange_gen);
+
+	smp_mb();
 	set_bit(dev, c->journal_debt.d);
+
+	return ticket;
+}
+
+static inline bool bch2_journal_debt_ticket_covered(struct bch_fs *c,
+						    unsigned dev, u64 ticket)
+{
+	return smp_load_acquire(&c->journal_completed_gen[dev]) >= ticket + 1;
 }
 
 /* Error tracking: */
