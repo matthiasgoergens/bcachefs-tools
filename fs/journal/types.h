@@ -49,6 +49,13 @@ struct journal_buf {
 	 */
 	struct bch_dev		*cas[BCH_REPLICAS_MAX];
 	struct bch_devs_list	devs_written;
+	/*
+	 * Devices with durability debt (c->journal_debt) exchanged in when
+	 * this entry was picked as a flush write - the scoped-preflush
+	 * target set. Stage 1: validation only, the preflush itself still
+	 * goes to every rw member.
+	 */
+	struct bch_devs_mask	flush_devs;
 	struct bch_io_failures	failed;
 
 	u64			last_seq;	/* copy of data->last_seq */

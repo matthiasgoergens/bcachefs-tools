@@ -739,6 +739,21 @@ struct bch_fs {
 	struct bch_devs_mask	devs_removed;
 	struct bch_devs_mask	devs_rotational;
 
+	/*
+	 * Journal durability debt: one bit per device, set at write endio
+	 * when a write whose key may be journaled completes without FUA.
+	 * Atomically exchanged into journal_buf.flush_devs when a flush
+	 * write is picked (journal/write.c); bits set after the exchange
+	 * belong to the next flush epoch - their keys cannot be in the
+	 * already-sealed entry, because publication always follows endio
+	 * (btree interior updates, move index updates and foreground
+	 * write-index updates all run off endio-driven closures).
+	 *
+	 * Scoped preflush stage 1 is shadow accounting: the preflush still
+	 * goes to every rw member; this mask feeds the validator.
+	 */
+	struct bch_devs_mask	journal_debt;
+
 	struct bch_opts		opts;
 	struct mutex		opt_change_lock;
 	u32			opt_change_cookie;
@@ -860,6 +875,21 @@ struct bch_fs {
 	struct btree_debug	btree_debug[BTREE_ID_NR];
 #endif
 };
+
+/*
+ * Register durability debt: a write that a journaled key may reference
+ * completed on device @dev without FUA, so the next flushing journal
+ * write must flush that device before becoming durable.
+ *
+ * Must be called in the write's endio (before any publication work is
+ * queued): a journal entry may only reference writes that completed
+ * before it was sealed, so debt set here always precedes the exchange
+ * into journal_buf.flush_devs of the flush that covers it.
+ */
+static inline void bch2_journal_debt_add(struct bch_fs *c, unsigned dev)
+{
+	set_bit(dev, c->journal_debt.d);
+}
 
 /* Error tracking: */
 

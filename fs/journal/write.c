@@ -1119,6 +1119,21 @@ void bch2_journal_do_writes_locked(struct journal *j)
 			j->flushes_outstanding++;
 
 			/*
+			 * Scoped preflush (stage 1, shadow): collect the
+			 * outstanding durability debt this flush will cover.
+			 * The exchange is atomic; debt registered from here
+			 * on belongs to the next flush epoch - those writes'
+			 * keys cannot be in this entry, which is sealed (no
+			 * open reservations, and publication follows endio).
+			 *
+			 * The preflush itself still goes to every rw member;
+			 * this set feeds the validator until stage 3 narrows
+			 * journal_write_preflush() to it.
+			 */
+			for (unsigned i = 0; i < BITS_TO_LONGS(BCH_SB_MEMBERS_MAX); i++)
+				w->flush_devs.d[i] = xchg(&c->journal_debt.d[i], 0);
+
+			/*
 			 * (Re-)arm the auto-commit timer: if nothing else
 			 * commits first, close + write the open entry in at most
 			 * journal_flush_delay.
