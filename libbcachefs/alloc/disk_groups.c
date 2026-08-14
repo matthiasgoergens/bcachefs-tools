@@ -65,6 +65,12 @@ static int bch2_sb_disk_groups_validate(struct bch_sb *sb, struct bch_sb_field *
 			prt_printf(err, "label %u empty", i);
 			return -BCH_ERR_invalid_sb_disk_groups;
 		}
+
+		if (BCH_GROUP_PARENT(g) > nr_groups) {
+			prt_printf(err, "label %u has invalid parent %llu",
+				   i, BCH_GROUP_PARENT(g));
+			return -BCH_ERR_invalid_sb_disk_groups;
+		}
 	}
 
 	struct bch_disk_group *sorted __free(kfree) =
@@ -153,7 +159,13 @@ int bch2_sb_disk_groups_to_cpu(struct bch_fs *c)
 			continue;
 
 		g = BCH_MEMBER_GROUP(&m);
+		unsigned seen = 0;
 		while (g) {
+			/* Guard against malformed on-disk parent chains:
+			 * bch2_sb_disk_groups_validate() rejects bad parents,
+			 * but keep the conversion total regardless */
+			if (g > nr_groups || ++seen > nr_groups)
+				goto err;
 			dst = &cpu_g->entries[g - 1];
 			__set_bit(i, dst->devs.d);
 			g = dst->parent;
@@ -167,6 +179,9 @@ int bch2_sb_disk_groups_to_cpu(struct bch_fs *c)
 		kfree_rcu(old_g, rcu);
 
 	return 0;
+err:
+	kfree(cpu_g);
+	return -BCH_ERR_invalid_sb_disk_groups;
 }
 
 const struct bch_devs_mask *bch2_target_to_mask(struct bch_fs *c, unsigned target)
