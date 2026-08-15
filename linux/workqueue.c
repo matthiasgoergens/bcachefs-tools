@@ -21,15 +21,6 @@ struct workqueue_struct {
 	char			name[24];
 };
 
-enum {
-	WORK_PENDING_BIT,
-};
-
-static bool work_pending(struct work_struct *work)
-{
-	return test_bit(WORK_PENDING_BIT, work_data_bits(work));
-}
-
 static void clear_work_pending(struct work_struct *work)
 {
 	clear_bit(WORK_PENDING_BIT, work_data_bits(work));
@@ -47,7 +38,7 @@ static int worker_thread(void *arg)
 
 	pthread_mutex_lock(&wq_lock);
 	while (1) {
-		__set_current_state(TASK_INTERRUPTIBLE);
+		set_current_state(TASK_INTERRUPTIBLE);
 		work = list_first_entry_or_null(&wq->pending_work,
 				struct work_struct, entry);
 		wq->current_work = work;
@@ -63,6 +54,7 @@ static int worker_thread(void *arg)
 			pthread_mutex_lock(&wq_lock);
 			continue;
 		}
+		__set_current_state(TASK_RUNNING);
 
 		BUG_ON(!work_pending(work));
 		list_del_init(&work->entry);
@@ -277,6 +269,14 @@ bool cancel_delayed_work_sync(struct delayed_work *dwork)
 	pthread_mutex_unlock(&wq_lock);
 
 	return ret;
+}
+
+void drain_workqueue(struct workqueue_struct *wq)
+{
+	pthread_mutex_lock(&wq_lock);
+	while (!list_empty(&wq->pending_work) || wq->current_work)
+		pthread_cond_wait(&work_finished, &wq_lock);
+	pthread_mutex_unlock(&wq_lock);
 }
 
 void destroy_workqueue(struct workqueue_struct *wq)

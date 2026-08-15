@@ -1,5 +1,853 @@
 # Changelog
 
+## v1.39.1 - Sun Aug 9 2026
+
+Bugfix release on top of v1.39.0. No on-disk format changes.
+
+### Features
+
+- check_lrus() should now be faster, pinning the btree that we'll be doing
+  random access to
+
+- The journal is re-replicated when a device comes back.
+
+### Bugfixes
+
+- bindgen was botching ioctl macro parsing for some users (clang version
+  dependent?), leading to tools failing with ioctl errors; the ioctls numbers
+
+- Multiple Rust/DKMS fixes: the Rust availability check reads the version out of
+  the kernel's own `libcore.rmeta` instead of `CONFIG_RUSTC_VERSION`, which only
+  records whichever rustc was present when the kernel was configured. That
+  mismatch failed builds that would have linked fine. Ubuntu HWE header meta
+  packages are accepted. are now exposed as constants from C shims.
+
+- Various fixes for 32bit machines
+
+- `subvolume snapshot`: snapshots are writable by default, and `--rw` now says
+  so rather than implying otherwise.
+
+- An oops in reconcile after an erasure coding allocation failure, reported by
+  KruslLee, and crashes on 32-bit.
+
+- fsck: several more small subvolume/snapshots repair fixes
+
+- Long SRCU holds across btree node reads no longer warn; on a loaded system
+  doing long btree scans this filled the log.
+
+## v1.39.0 - Mon Aug 3 2026
+
+Feature release on top of v1.38.8, with an on-disk format change:
+bcachefs_metadata_version_per_dev_fragmentation_lru
+
+Major changes:
+
+- Per-device fragmentation LRUs
+- Failure domains
+- File level damage tracking
+- bcachefs kvdb
+- Snapshot hardening
+
+### Features
+
+#### Per-device bucket fragmentation LRUs
+
+The fragmentation LRU, used by copygc, is now per device instead of filesystem
+wide. This solves long standing contention issues between reconcile and copygc,
+particularly with tiered setups.
+
+#### Failure domains
+
+Devices can be tagged with a failure domain — a shelf, a chassis, a rack,
+whatever the thing is that fails together — and replicas are spread across
+domains rather than merely across devices. This covers data allocation, journal
+replicas, and erasure-coded stripe blocks, which now require distinct domains.
+Set it with the new `failure_domain` per-device option; `bcachefs fs
+failure-domains` shows the layout.
+
+Note that failure domains are only a hard constraint for erasure coding; normal
+replicated allocations will reuse a failure domain if necessary to meet replicas
+requirements; erasure coding will shorten stripes to the number of failure
+domains available.
+
+#### Damage tracking
+
+What was lost is now recorded persistently, in a new btree, instead of being
+printed once during fsck and thereafter recoverable only from logs. fsck records
+inode-scoped damage keyed by `bch_sb_error_id`, and data lost to device
+force-removal and to read errors is recorded the same way.
+
+`bcachefs damage` shows what's recorded; the list can also be walked from
+userspace through the new readdir/damage ioctls, and is exposed in debugfs. fsck
+summarizes damaged paths at the end of recovery, resolving them through surviving
+snapshot versions and naming the parent directory for inodes whose own dirent is
+gone.
+
+#### bcachefs kvdb
+
+A new REPL for reading and editing btree keys and the superblock directly — the
+tool most of this release's repair work was built and debugged with. It has
+readline, tab completion for commands and btree names, and ^C interrupts the
+running command. Read-only norecovery open is the default, with `--rw` to edit,
+`--nostart` for superblock-only access, and `--journal` for `list_journal`.
+
+Reads and writes go down to individual fields: `get`/`peek` take trailing field
+paths, and vartail fields, named bitmask fields and enum value names for state
+fields all work. There's a session snapshot context, overridable per-command with
+an explicit `:snapshot` in a pos. Underneath it is new runtime type information
+for the C structs (`#[derive(TypeInfo)]`).
+
+#### Snapshot hardening
+
+Snapshot deletion is the most destructive thing the filesystem does, and what
+licenses it is metadata. That used to be a flag bit: one flipped bit, a torn
+deletion or a half-finished repair could make a live snapshot look deletable.
+
+Three things now have to agree before anything is deleted. The state fields are
+enums whose values are at least 14 bits apart rather than bitflags, so no single
+bit flip can turn one valid state into another. Deletion is no longer triggered
+by the snapshot node alone: the snapshots and subvolumes btrees are independent
+records of the same fact and both have to agree. And per-snapshot key counts let
+deletion verify it actually moved everything, refusing and scheduling repair if
+not. Deletion also no longer destroys information, and damage found at runtime
+defers to repair instead of BUG_ON.
+
+There's a lot of new repair code for damaged snapshot trees that would previously
+have been refused, and it's tested by injection: `bcachefs kvdb` writes specific
+corruptions into the btree, and the new `snapshot-inject` suite — 68 cases —
+asserts that fsck detects the error, repairs it, converges, and the data
+survives.
+
+Credit to ZorbaTHut (Ben Rog-Wilhelm), who reported this and worked with us
+extensively, providing metadata dumps and tests; several people jumped in on
+this one.
+
+#### Performance
+
+ACL and per-inode-option lookups are skipped entirely when the inode has none,
+via the new `has_access_acl`, `has_default_acl` and `has_inode_opts` flags.
+Bucket allocation can be targeted. Erasure coding allocates stripe blocks near
+the stripe's centroid and reallocates outliers.
+
+#### Portability
+
+PREEMPT_RT: new `mutex_noio` and `percpu_rwsem_noio`, with `sb_lock`,
+`mark_lock`, the btree cache lock and the journal buf lock converted; `GFP_NOFS`
+replaced with `GFP_NOIO`; data writes set `PF_MEMALLOC_NOIO`; `time_stats` uses
+`local_lock`. 32-bit builds get `__aeabi_uldivmod`/`__aeabi_ldivmod` stubs for
+ARM modules, 64-bit divisions via `div64_u64`, and a `mul_u64_u64_div_u64` fix
+(#795). Also builds on `CONFIG_SCHED_ALT` (BMQ/PDS) kernels, with `WQ_PERCPU`
+compat for kernels older than 6.17 and slab realloc compat for older than 6.18.
+
+#### Tools
+
+Offline `set-fs-option` and `set-state` actually write the superblock now.
+`bcachefs list` works on mounted filesystems, `dump --single-replica` produces
+de-replicated metadata dumps, and `kill_btree_node --error` can inject a csum
+error type.
+
+### Behaviour changes
+
+**Reverted from v1.38.7:** multi-device filesystems no longer show the filesystem
+UUID as the mount source.
+
+A subvolume can now be deleted by rename-overwrite of its root, and `bcachefs
+subvolume snapshot` takes `--rw`. Devices with durability=0 are excluded from
+normal allocation logic, which changes placement on cache and tiering setups.
+
+Commit-time validation of snapshot and subvolume state invariants is now on: a
+buggy writer is caught in the act with a backtrace instead of leaving the mess
+for fsck. It can be turned off with `no_commit_validate`.
+
+New `btree_cache_shrinker_seeks` option (runtime, default 2) controls how readily
+the shrinker reclaims btree nodes relative to other caches; `ratelimit_errors` is
+now runtime-settable too. The unclean-shutdown journal sequence skip was widened
+from 64 to 4096, the passphrase prompt is usable on raw early-boot consoles, and
+`format` rejects `--version` together with `--source`.
+
+### New ioctls
+
+`BCH_IOCTL_QUERY_BTREE_KEYS` queries btree keys directly, with
+slots/prev/all_snapshots/nofilter_whiteouts flags; it's what backs `bcachefs
+kvdb` and `bcachefs list` on a mounted filesystem. `BCHFS_IOC_GET_DAMAGE`,
+`BCHFS_IOC_CLEAR_DAMAGE` and `BCHFS_IOC_READDIR_FLAGS` (with a recursive damaged
+mode) expose the damage btree. Also `BCH_IOCTL_SNAPSHOT_TREE_v2`.
+
+### Bug fixes
+
+Two buffered read bugs could return wrong data. A read that took an internal
+retry could resume with a stale `bi_iter`, and separately a stale
+`BCH_READ_last_fragment` could persist across retries — in both cases the read
+completed successfully with the wrong bytes, silently. Reported by jrt37, with
+an exceptional analysis pinning both.
+
+Extent merging could corrupt compressed data: extents compressed in different
+blobs were merged as though they were compatible. Reported by KatalinSB, who hit
+it as akonadi database corruption under zstd. Relatedly, checksum type changes on
+compressed extents and MAC width changes on encrypted extents were both mishandled
+— reported by Zorba, with ktest reproducers for each.
+
+Inode numbers were truncated to 32 bits in the VFS layer, so filesystems that had
+allocated past 2^32 could return the wrong inode to userspace; readdir dirent
+translation had a matching bug on 32-bit.
+
+fsck: a `-ENOMEM` in `check_dirents` and unbounded transaction memory in the
+`check_dirents`, `check_xattr` and `insert_snapshot_whiteouts` repair loops could
+each stop a repair partway. `bch2_reattach_inode()` is now resumable under
+partial commits, so a large orphan chain doesn't lose progress when a commit
+splits. Also a null deref in `reconstruct_inode()` on an extent-less inum, and
+`bch2_check_key_has_inode()` on inodes with only error keys — reported by
+sickness, after a power outage took out both his replicas.
+
+Elsewhere: deleting compressed snapshot extents could NULL-deref on a missing
+disk reservation (reported by pio2398); a cross-snapshot `str_hash` duplicate
+could BUG_ON; emergency read-only could remove a device that still had journal on
+it; and a 34-device array on an 8GB box could OOM partway through fsck from
+undeduplicated async btree ops (reported by Zorba).
+
+### Documentation
+
+New Principles of Operation sections: safety mechanisms, snapshots and snapshot
+deletion, failure domains, and how `ec_max_data_blocks` and failure domains bound
+stripe width (that last after doot asked on IRC). `bcachefs kvdb` documentation
+is shared between `--help` and the PoO.
+
+## v1.38.8 - Fri Jul 3 2026
+
+- Fix dpkg builds.
+- Fix journal preflushes being throttled by writeback throttling
+
+## v1.38.7 - Fri Jul 3 2026
+
+Bugfix and kernel-support release on top of v1.38.6, adding Linux 7.2 support
+and DKMS Rust builds on kernels without CONFIG_RUST. No on-disk format changes.
+
+### Kernel support and packaging
+
+- Builds against Linux 7.2.
+
+- bcachefs.ko can now be built with its Rust components even on kernels
+  configured without CONFIG_RUST, by vendoring the kernel's Rust support tree.
+  DKMS can also fetch a prebuilt, signed module instead of building locally when
+  one is available, and module signing for Secure Boot is supported. Mount now
+  reports the actual Rust build status rather than CONFIG_RUST.
+
+### Erasure coding
+
+- Stripes now go through the key cache, with assorted cleanups to stripe
+  deletion and triggers; several EROs have been removed and can now be repaired
+  more gracefully.
+
+- Durability accounting for erasure-coded data was reworked and an off-by-one
+  fixed: reconcile now recomputes durability per candidate when selecting
+  replicas to drop, and floors invalid-device padding at the stripe's
+  repairable durability.
+
+### Features and tooling
+
+- Mount: mount by filesystem label; the mount helper honors mount(8)'s -f
+  (fake), -s (sloppy) and no-mtab compatibility flags and reports modprobe
+  failures; multi-device filesystems show the filesystem UUID as the mount
+  source. FUSE mount parses -o options and no longer writes daemon logs to /tmp.
+
+- Commands/CLI: new `get-file-option`; `set-file-option` can delete individual
+  choice-typed options; the CLI accepts negative values and mask values for
+  bitfield options; typed usage shows full option paths; `unlock --check`
+  reports encryption and lock state.
+
+- New `move_writes_fua` option. The previous release switched writes from
+  internal moves to REQ_FUA to avoid impacting fsync() latency, especially on
+  tiered setups where foreground writes that need to be synced would be on SSDs
+  and background moves would be to spinning rust, but this turned out to be a
+  drastic performance regression; using FUA for internal moves is now off by
+  default but available for further testing.
+
+- Online device shrink is delegated to the kernel, so a mounted filesystem can
+  be shrunk with `bcachefs device resize`.
+
+- format warns when replicas would share a disk, and wipes former-partition
+  filesystem signatures when formatting a partitioned whole disk (previously it
+  only warned).
+
+- subvolumes may now be listed recursively
+
+### Bug fixes
+
+- **fsck** could loop, repeatedly "repairing" the same need_discard/freespace
+  entry without converging: the write-buffer flush cache wasn't invalidated when
+  a repair committed, so the re-check read stale data and re-flagged a key it had
+  just fixed. fsck now tracks the journal commit sequence and re-flushes once a
+  repair has landed.
+
+- **fsck** was also drastically slowed by unratelimited repair logging: a log
+  class meant to ratelimit repeated messages never did (the suppress flag was
+  accepted but discarded), and a second path had its ratelimit inverted. Both
+  are fixed.
+
+- A stale or mismatched erasure-coding stripe pointer is now logged as a
+  repairable fsck error and repaired, instead of taking the filesystem
+  inconsistent.
+
+- Snapshot repair hardening: keys are migrated out of deleted interior nodes,
+  and accounting is checked before destructive node transitions.
+
+- Fixed a use-after-free in erasure-coding stripe buffer teardown; two journal
+  read bugs (an uninitialized full-read flag and an undersized journal-rewind
+  re-read buffer); HAS_TOPOLOGY_ERRORS is now cleared when check_topology passes
+  clean; and alloc-info checks are cancellable.
+
+- Encryption: fixed superblock encryption on big-endian systems; key material is
+  zeroed on drop; the systemd-ask-password key name is shared with cryptsetup.
+
+- Security and permissions: per-object accounting ioctls now require
+  CAP_SYS_ADMIN; security xattrs are initialized on inode creation.
+
+- Devices: udev is refreshed after device add; multipath prefers mapper paths
+  and verifies the underlying rdev before substituting a mapper devnode.
+
+- `bcachefs fs usage` tolerates offline devices; recovery logs journal-replay
+  progress; write-buffer and nocow lock waits are now SRCU-aware; and data reads
+  verify that gzip decompresses to the full extent size.
+
+### Documentation
+
+- Extensive manpage and documentation improvements, covering degraded and
+  split-brain mount recovery, superblock recovery, encryption key handling,
+  subvolume queries and quotas, device options, filesystem limits, and more.
+
+## v1.38.6 - Wed Jun 17 2026
+
+Feature and performance release on top of v1.38.5. No on-disk format changes.
+
+### Performance
+
+Performance work spanned much of the codebase, quite a few workloads and
+benchmarks were profiled. Some highlights:
+
+- Many performance improvements in the journalling code, primarily targeting
+  lock contention. Journal flushes are now fully lockless, significantly
+  improving performance on multithreaded O_SYNC/fsync workloads.
+
+  Journal pin lists now have per-pin-list locks instead of sharing the main
+  journal lock, and the journal pin fifo can now be resized at runtime; this
+  avoids unnecessary throttling on O_SYNC/fsync heavy workloads.
+
+  Journal read now has to read significantly less of the journal by using a
+  binary search to find the most recent entry on each device, which we're also
+  taking advantage of by increasing the default journal size.
+
+- The core btree iterator and transaction commit code saw significant profiling
+  and optimization, greatly reducing icache usage in particular.
+
+- Btree sharding was greatly improved; we now shard new inode allocations based
+  on pid, not the current cpu, enforce that btree nodes do not cross shard
+  boundaries, and on lock contention we try to migrate threads to the CPU for
+  their data's shard. This drastically reduces lock contention; high client
+  count dbench particularly benefited.
+
+- Multithreaded btree write-buffer flushing saw more improvements, reducing
+  stalls due to lock inversion, and runtime introspection was greatly improved.
+
+### Features
+
+- We now support up to 255 devices in a filesystem
+
+- Ubuntu 26.04 now has packages available at apt.bcachefs.org
+
+### Bugfixes
+
+- Some OOM issues were fixed; throttling when the btree node cache is too dirty
+  was significantly improved
+
+- Reconcile won't get stuck in hysterises when there's high priority work to do
+
+- Reconcile no longer spins when btree nodes need to be moved, but can't be
+  written with the full requested durability
+
+- A few EC corner cases were fixed, including in device removal
+
+- Device add is now fully transactional; crashing partway through won't leave
+  accounting/allocation info for the new device in an inconsistent state
+
+- Some rare deadlocks in the device error handling paths were fixed
+
+- bcachefs wait-devices now uses the same superblock filtering logic as mount,
+  so stale superblocks from removed devices are ignored consistently.
+
+## v1.38.5 - Wed Jun 10 2026
+
+Bugfix release on top of v1.38.4. No on-disk format changes.
+
+### Bug fixes
+
+Mounting after an unclean shutdown could OOM during journal replay on
+filesystems whose journal is large relative to system memory (i.e. many
+devices): journal replay's sorted-order fastpath holds every journal pin
+until replay finishes, which prevents journal reclaim from writing back
+and freeing dirty btree nodes — so on a large journal the btree node
+cache could eat all of memory before the journal-space fallback ever
+triggered. Journal replay now watches the btree node allocator's
+memory-pressure self reclaim counter (also newly shown in the btree_cache
+debug output) and switches to sequential replay, which releases journal
+pins as it goes. Reported by ZorbaTHut.
+
+The DKMS build was broken on kernels older than 6.18
+(`kvmalloc_node_align` is a 6.18+ API; one call site was missing a
+version guard). Reported by marcin.
+
+`bch2_update_unwritten_extent()` was dropping the write op's flags when
+allocating for an unwritten extent conversion.
+
+Fixed a NULL pointer dereference in the `bfloat_failed` debugfs file.
+
+### Userspace
+
+`bcachefs fsck -o recovery_passes=<passes>` now honors the explicit pass
+selection: previously the fsck option was still set, which ORed in the
+full fsck pass set on top of the user's request.
+
+### Other
+
+- Debug builds now announce themselves in the log at startup.
+
+## v1.38.4 - Tue Jun 9 2026
+
+Bugfix release on top of v1.38.3. No on-disk format changes.
+
+### Userspace
+
+`bcachefs fs top` gained live tracepoint drill-down: every counter on the
+counters page now has an interactive drill-down (Enter) into a live tail
+of the corresponding tracepoint, scoped to the current mount. Scrollback
+with arrows/PgUp/PgDn, End to resume following the tail.
+
+### Bug fixes
+
+`bch2_dev_add()` is now transactionally correct — the device add path was
+missing a superblock write, and the bucket-usage accounting was not
+idempotent across recovery, so a half-finished device add on a crashed
+filesystem would double-count free space, and the device label would not
+be persisted.
+
+A number of btree-update error-path bugs were fixed — under heavy
+split/rewrite load (copygc, tiering, rebalance) a failed interior update
+could leak btree node locks and open-bucket refs, eventually wedging the
+filesystem at shutdown.
+
+Two erasure coding bugs were fixed — a pointer collision when migrating
+stripe blocks between devices, and a bug where evacuated buckets ignored
+EC (erasure coding) data, so some blocks were left behind on device
+removal. Also, `stripe_update_extent` had been dropping excess replicas
+without calling `set_needs_reconcile`, so the filesystem wasn't
+re-replicating degraded stripes.
+
+An OOM under memory pressure was fixed — the btree-key-cache shrinker was
+giving the VM a zero-cost hint (`seeks=0`), causing pathological cache
+refill, and the btree buffer cache wasn't self-reclaiming when the system
+was tight. Reported by TiCPU.
+
+Backpointers repair in fsck can now repair duplicate extents pointing to the
+same data.
+
+### Other
+
+- `bch2_subvol_is_ro_trans()` now returns true for subvolumes that are
+  being deleted — create/rename/setattr could previously modify a subvol
+  mid-deletion.
+- Promotes to cache devices no longer risk landing on a zero-durability
+  device.
+- `shard_inode_numbers_bits` is now capped by filesystem size — on small
+  filesystems pre-split metadata was blowing the filesystem create budget.
+- Journal discard workqueue no longer use-after-frees on going read-only.
+- DKMS build fixes.
+## v1.38.3 - Sun May 10 2026
+
+Maintenance release on top of v1.38.2. No on-disk format changes.
+
+### Erasure coding: in-place stripe widening
+
+Stripes can now widen — adding data blocks when more devices become
+available — without a full re-encode. New `bch_stripe.can_widen` field
+tracks eligibility; reconcile-scan refreshes it on existing stripes,
+and a fresh fsck check ensures it stays consistent. Previously the
+only way to grow stripe width was to write new data into a wider
+stripe and let the old one age out via copygc.
+
+### Performance
+
+- 3:2 btree node merging: btree node occupancy roughly doubles, and a cache for
+  utilization of evicted btree nodes - btree node merge attempts no longer
+  thrash the btree node cache.
+- `__bch2_bkey_unpack_key` is now significantly faster, using precomputed format
+  constants.
+- Per-btree btree write buffer flushing is now properly multithreaded, and out
+  of the journal reclaim thread.
+- With reconcile now generating much heavier metadata workloads, we now have
+  ratelimiting for btree node cache utilization and IO pressure, addressing OOM
+  issues on some fileserver workloads. This will in the future be rolled into
+  the generalized backpressure subsystem; we'll be watching to see how this
+  affects performance.
+
+### Userspace
+
+`bcachefs fs top` gained live tracepoint drill-down: every counter on the
+counters page now has an interactive drill-down (Enter) into a live tail
+of the corresponding tracepoint, scoped to the current mount. Scrollback
+with arrows/PgUp/PgDn, End to resume following the tail.
+
+### Bug fixes
+
+Many - the full test suite in the CI is now down to 15-20 failures per run, out
+of 13k tests.
+
+## v1.38.2 - Sat May 2 2026
+
+### Build fix
+
+`bdev_rot()` was introduced in Linux 7.0, not 7.1 as the v1.38.1 shim
+assumed — so the DKMS module failed to build on 7.0.x with a
+"redefinition of 'bdev_rot'" error. Shim is now correctly version-gated
+to `< 7.0`.
+
+### Performance: accounting read
+
+Fix an O(N×R) memmove pattern in `accounting_read_mem_fixups`. The pass
+that drops zeroed/invalid entries was iterating reverse and calling
+`darray_remove_item` per drop, which memmoves the tail back on each
+removal. On large multi-device filesystems the replicas table grows
+combinatorially with device count, and many entries come back zero on
+read, so the cost was dominating mount time. Replaced with an in-place
+forward filter — O(N) total. Reported by feedc0de (63-drive array).
+
+## v1.38.1 - Sat May 2 2026
+
+Maintenance release on top of v1.38.0. No on-disk format changes.
+
+### Linux 7.1 support
+
+The DKMS module now builds against Linux 7.1. Several upstream kernel
+changes broke the previous build:
+
+- `xor_blocks()` → `xor_gen()` (chunking is now handled internally)
+- `bool_names` (fs_parser) is now static; carry our own table
+- `bdev_nonrot()` → `bdev_rot()`
+- `<linux/pagevec.h>` → `<linux/folio_batch.h>`
+
+Older kernels remain supported via version-gated shims.
+
+### Performance
+
+The locking subsystem and btree cache both got significant work.
+
+- SIX locks/cycle detector: The deadlock cycle detector is now significantly
+  faster, fully lockless with no atomic operations or barriers, and we now
+  prioritize the oldest transaction on lock wakeups and deadlock avoidance
+  aborts, significantly improving performance on multithreaded workloads with
+  lock contention.
+- Btree write buffer flushing is now multithreaded
+- The btree node cache saw significant cleanups and refactoring, and now has
+  separate clean and dirty lists, again for improved performance under load.
+- Btree node merging: lookup-side btree node merge attempts are now much less
+  aggressive; this was causing significant btree node cache thrashing on some
+  large filesystems. More performance improvements are on the way.
+- When waiting on a device to have free buckets available, spurious wakeups
+  should be significantly reduced.
+
+### New mount option: `ec_max_data_blocks`
+
+Caps the data-block count of new EC stripes. Lets you keep stripe
+width below the device count when you don't want a full-width
+stripe — useful when the device count is high but you'd rather
+limit the read-amplification cost on stripe reconstruct.
+
+### New: `bcachefs wait-devices`
+
+New command that waits for all devices of a multi-device filesystem
+to be present before exiting. Intended as a `WantedBy=` of a `.mount`
+unit so systemd doesn't try to mount before all members are visible.
+Ships with a `bcachefs-wait-devices@.service` template unit in the
+Debian package.
+
+### Userspace
+
+`bcachefs fs top` gained live tracepoint drill-down: every counter on the
+counters page now has an interactive drill-down (Enter) into a live tail
+of the corresponding tracepoint, scoped to the current mount. Scrollback
+with arrows/PgUp/PgDn, End to resume following the tail.
+
+### Bug fixes
+
+Discard:
+
+- **Per-device discard rewind-advance budget**. The journal-rewind
+  buffer used by the discard worker was sized fs-wide, which meant
+  one device with little need_discard activity could starve the
+  budget for another. Now per-device. Fixes the discard worker
+  iterating but finding nothing (`seen=0`) on multi-device
+  filesystems.
+- Properly flush in-flight discards before finding more.
+- `bch2_discard_one_bucket()` now respects `buckets_nouse`.
+- Sysfs FS-level entry for `OPT_FS+OPT_DEVICE` opts (just `discard`
+  today) is dropped — it had been lying on read and silently
+  no-op'ing on write. The per-device sysfs entries and the
+  mount-time `-o discard=` flag are unchanged.
+
+Recovery / fsck:
+
+- Journal rewind now actually runs on clean filesystems (was a
+  no-op).
+- Fix "Second fsck run was not clean" false positive.
+- Torn-read race in `bch2_sb_update()` fixed (the
+  `bucket_gens_key_wrong` reconstruct_alloc flake).
+
+Reconcile:
+
+- Always flush the btree write buffer when starting a phase.
+- Stop reconcile before disabling `c->writes` on going-RO.
+
+Locking / transactions:
+
+- six_lock: fix wait_fifo leak on grow-race + `-ENOMEM` path.
+- Disable migration when in a transaction (per-CPU state stays
+  stable across the trans).
+- migrate_disable scope narrowed to btree-locked sections (also
+  unblocks suspend on bcachefs).
+
+EC:
+
+- `should_cancel_stripe()` now checks reused-block ptrs.
+- Bounded drain of in-flight stripe commits on going-RO.
+
+Btree:
+
+- Cache cannibalize lock leak in `node_get_noiter`.
+- Memory-alloc error path leak in `bch2_btree_node_mem_alloc()`.
+- `bch2_btree_path_fix_key_modified` re-sorts the iterator after a
+  key modification.
+- `fpunch` no longer deletes multiple extents at a time.
+- Drop stale `BUG_ON` in `bch2_read_retry_nodecode()`.
+
+Other:
+
+- Direct IO read error path fix.
+- Shutdown-specific journal quiesce.
+- `str_hash` repair: missing `traverse()` in `dup_entries` (and a
+  separate one in `repair_key`).
+
+### New: per-device `freelist_wait` counters
+
+Per-device counters for allocator wait events, plus explicit helpers
+to manage them. Gives much better visibility into which device is
+the contention point during allocator stalls.
+
+### Removed: `btree_cache_size_max` mount option
+
+Reverted. This was a workaround capping btree cache size to force
+cannibalization under memory pressure; the btree cache work in this
+release addresses the underlying issue properly. Anyone who set the
+option can drop it.
+
+### Tools
+
+- `bcachefs top` and `bcachefs timestats` got paged, tabbed,
+  scrollable displays. With many devices the per-device tables had
+  been pushing other stats off-screen; pages now grow independently.
+  `timestats` also adds an `e` toggle between lifetime and
+  recent-EWMA views, freeing columns to show frequency mean/stddev.
+  `top` drops the `d` devices toggle (subsumed by the devices page).
+  Keys: Tab/Shift-Tab to switch pages, Up/Down/PageUp/PageDown/Home/End
+  to scroll.
+- `bcachefs migrate` no longer enables reconcile/copygc during
+  migration — data was being moved (and re-checksummed) before the
+  new superblock had been committed.
+- `list_journal -o` now accepts mount options; non-negotiable
+  journal-reading flags are layered over the user's options.
+
+### DKMS / packaging
+
+- DKMS module now builds against Linux 7.x and later (#557).
+- DKMS keeps debug symbols in the installed module — useful for
+  meaningful backtraces in perf/trace output when users hit bugs.
+- musl build fix: use `libc::Ioctl` instead of `libc::c_ulong` for
+  ioctl request constants (#561).
+- APT repository: published-repo instructions corrected, key files
+  now armored `.asc`, CI workflows switched to a binary keyring.
+- Nix flake: instructions for pulling a snapshot version, a
+  `nixosModules` configuration template, rust overlay composed at
+  the flake level, and module-package resolution through overlays
+  (#533).
+
+### Build
+
+- MSRV bumped to Rust 1.85.
+- Userspace `ida_alloc_range`/`ida_free` implementation — `fast_list.c`
+  needed the modern API and the legacy shim was never implemented, so
+  the userspace build was broken as soon as it started compiling that
+  file. Implemented as a d-ary bitmap tree rather than vendoring
+  `lib/idr.c` + `lib/xarray.c`.
+- Various Rust cleanups: `PathBuf` for paths in `device_scan.rs`,
+  `parse_uuid_equals` extraction, `read_super_silent` returns
+  `BchError`.
+
+## v1.38.0 - Sun Apr 19 2026
+
+bcachefs_metadata_version_need_discard_by_journal_seq
+
+The `need_discard` btree (tracking buckets pending discard) is now
+indexed by journal sequence number instead of device/bucket. This
+reshapes how the allocator cooperates with the discard worker.
+
+- Fixes allocator-stuck-on-mount regressions (#1105, #1108).
+  Previously, mounting a filesystem whose metadata devices had very
+  few free buckets could stall during journal replay — the allocator
+  and discard worker couldn't make progress past each other. The new
+  layout breaks that deadlock.
+- Much faster sustained discard throughput. The discard worker
+  now iterates the need_discard btree in seq order directly, rather
+  than scanning the full set each pass. Noticeable on write-heavy
+  workloads, particularly on larger filesystems.
+
+Upgrade is automatic on mount. Downgrade to a pre-1.38 version
+requires offline downgrade tooling (existing format supports this).
+
+### Journal pipelining
+
+Previously we were limited to 16 in flight journal writes at a time, but for
+large arrays this had become a severe bottleneck. We now have a separate
+fifo for in flight journal writes; we currently allocate 256 entries, and if
+that limit is ever hit it's now trivial to make growable at runtime.
+
+### Faster snapshot_read at mount time
+
+Users with large numbers of snapshots should notice dramatically faster mount
+times; an accidental O(n^2) from incorrectly growing the in-memory snapshot
+table has been fixed.
+
+### Userspace
+
+`bcachefs fs top` gained live tracepoint drill-down: every counter on the
+counters page now has an interactive drill-down (Enter) into a live tail
+of the corresponding tracepoint, scoped to the current mount. Scrollback
+with arrows/PgUp/PgDn, End to resume following the tail.
+
+### Bug fixes
+
+- `bcachefs format` no longer misdetects SSDs as rotational when given a
+  partition (#554). If you created a filesystem on a partition (e.g.
+  `/dev/nvme0n1p3`) with 1.37.5, the rotational flag may have been set to 1
+  incorrectly; re-check with `show-super` and adjust if needed. New filesystems
+  are correct.
+- Fix reconcile spinning forever on encrypted filesystems with nocow enabled.
+  These options are not compatible — encryption
+  falls back to COW automatically now. Documented in the man page.
+- Fix `bcachefs migrate` failing on some devices due to O_DIRECT alignment
+  issues.
+- The stripe repair path now correctly handles full stripes with a block on a
+  device that has been force removed and need to be shrunk - instead of spinning
+  when it picked the block on the force-removed device to evacuate.
+
+### Tools
+
+- `bcachefs dump sanitize` output is now correct (was inverted for
+  certain key formats).
+- `list_journal -k` now correctly handles multiple ranges with
+  per-range signs.
+- GPG signing key for `apt.bcachefs.org` is now published directly
+  at that URL. (Note: Debian third-party-repo policy issue flagged
+  in #555 is not yet resolved; will address in a follow-up.)
+- Documentation for nocow+encryption interaction.
+
+### Documentation
+
+The principles of operations continues to grow; it now has more extensive
+documentation on btree internals and architecture, from folding in and updating
+documentation that was previously on the wiki.
+
+## v1.37.5 - Mon Apr 7 2026
+
+New features:
+
+- Offline device add: `bcachefs device add` now works without the
+  filesystem mounted, discovering member devices automatically
+- Show device serial numbers in `show-super` output
+
+Bug fixes:
+
+- Fix fd leak in format()
+- Fix sticky device options not carrying across subsequent devices
+  during format
+- Fix super_io write path (two fixes from intelfx)
+- DKMS: add linux-headers virtual package fallback (#540)
+
+Rust migration:
+
+- Replace C `struct dev_opts` with Rust `DevOpts` type
+- Safe typed field API for superblock access
+- Safe wrappers for opts, dev_opts, opt_set_by_id, bch_opt_strs
+- Move get_size, get_blocksize, fd_to_dev_model from C to Rust
+- Add nonrot() Rust wrapper, replace C bdev_nonrot
+- Safe error string access via errcode msg() method
+- Remove unnecessary extern "C" from Rust-only functions
+
+Kernel source updates:
+
+- Fix handling of stripe_buf limits (#1096, #1098)
+- Fix bad return code from stripe_reuse()
+- Fix str_hash repair silently failing when insert finds duplicate
+- Fix rename computing wrong hash with casefolding
+- Reconcile: mark ec_alloc_failed extents as pending
+- Preserve pre-recovery journal keys across journal_keys_sort
+- Record device serial number in superblock
+- Print write buffer state in journal stuck diagnostic
+- Improved allocator error matching in foreground.c
+- write_op_to_text(): include open_buckets
+
+## v1.37.4 - Sun Mar 29 2026
+
+New commands:
+
+- `bcachefs data-read`: O_DIRECT read via BCHFS_IOC_PREAD_RAW with extended
+  error reporting (checksum, IO, decompression, and EC errors). Supports
+  `--no-poison-check` for reading poisoned extents.
+- `bcachefs unpoison`: Clear poison flags on file extents.
+
+Bug fixes:
+
+- Fix shell completion generation panic
+- Fix group subcommand dispatch off-by-one
+
+Tools improvements:
+
+- Migrated to clap derive for subcommand dispatch with typed Cli structs
+- Enabled clap suggestions and color help, stripped debuginfo from release builds
+
+Kernel source updates:
+
+- Fix segfault in bch2_stripe_new_buckets_del()
+- Fix reconcile checksum rewrite skipping cached pointers
+- Fix use-after-free in ec_block_endio()
+- Fix cached pointer handling in data update
+- Fix init_new_stripe_from_old() copying parity blocks
+- Fix torn write of path->l[0].b in btree_path_copy()
+- Fix linking error on i586
+- BCH_SB_MEMBER_INVALID pointers don't count as written or unwritten
+- Don't add cached pointer devices to devs_have
+- Don't reuse stripes when live data would overflow into parity
+- Detect and repair non-zero parity blockcounts
+- Plumb EC reconstruct messages to read path
+- Add BCHFS_IOC_PREAD_RAW and BCHFS_IOC_UNPOISON ioctls
+- Read path error reporting infrastructure
+- Don't start reconcile unless we're really going rw
+- Add timestats for btree node/key cache shrinkers
+- Improve bch2_bio_to_text(), include bio on BLK_STS_INVAL read errors
+- Improve error message when autofix blocked by errors policy
+- Automatically advance rewind_seq when journal_rewind_discard_buffer_percent=0
+
+Package CI:
+
+- Publish to release suite for tagged commits
+- Atomic publish via staging directory + rsync (fixes apt hash mismatch, #543)
+
 ## v1.37.3 - Fri Mar 20 2026
 
 New option: opts.journal_rewind_discard_buffer_percent
@@ -101,6 +949,13 @@ Highlights:
   replicated filesystems) - or if the data is not recoverable we'll automatically
   rewind to the last good state. By default, we won't rewind more than 10
   seconds, controlled by the `scrub_journal_max_rewind_secs` option.
+
+### Userspace
+
+`bcachefs fs top` gained live tracepoint drill-down: every counter on the
+counters page now has an interactive drill-down (Enter) into a live tail
+of the corresponding tracepoint, scoped to the current mount. Scrollback
+with arrows/PgUp/PgDn, End to resume following the tail.
 
 ### Bug fixes
 

@@ -1,3 +1,4 @@
+/bcachefs-wait-devices@.service
 /result
 bcachefs.5
 .*
@@ -14,6 +15,7 @@ compile_commands.json
 dkms/dkms.conf
 dkms/module-version.c
 initramfs/hook
+build.vars
 
 # dot-files that we don't want to ignore
 !.gitignore
@@ -24,9 +26,16 @@ initramfs/hook
 bcachefs-principles-of-operation.*
 doc/generated/
 
-bch_bindgen/Cargo.lock
+fs/bcachefs-kernel/Cargo.lock
+
+# Vendored-Rust build scratch: fs/Makefile builds the kernel's target-spec
+# generator in here and runs it to produce target.json, and
+# Makefile.rust.vendor stages the vendored stack alongside it. All generated,
+# and the generator is a multi-megabyte binary sitting in the source tree.
+fs/vrust/
 
 # will have compiled files and executables
+/build/
 /debug/
 /target/
 /vendor/

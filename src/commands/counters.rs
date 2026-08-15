@@ -1,12 +1,13 @@
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
+use bch_bindgen::fs::FsExt;
 use bch_bindgen::c;
 use bch_bindgen::c::bch_degraded_actions;
 use bch_bindgen::c::bch_persistent_counters::BCH_COUNTER_NR;
-use bch_bindgen::fs::Fs;
-use bch_bindgen::opt_set;
-use bch_bindgen::sb::COUNTERS;
+use bcachefs_kernel::fs::Fs;
+use bcachefs_kernel::opt_set;
+use bcachefs_kernel::sb::io::COUNTERS;
 use clap::Parser;
 
 fn match_counter(name: &str) -> Result<usize> {
@@ -16,7 +17,7 @@ fn match_counter(name: &str) -> Result<usize> {
 
 #[derive(Parser, Debug)]
 #[command(about = "Reset all counters on an unmounted device")]
-struct Cli {
+pub struct Cli {
     /// Reset specific counters (comma-separated), not all
     #[arg(short, long, visible_alias = "counter")]
     counters: Option<String>,
@@ -25,8 +26,7 @@ struct Cli {
     device: String,
 }
 
-pub fn cmd_reset_counters(argv: Vec<String>) -> Result<()> {
-    let cli = Cli::parse_from(argv);
+fn cmd_reset_counters(cli: Cli) -> Result<()> {
 
     let to_reset: Vec<usize> = if let Some(ref names) = cli.counters {
         names.split(',')
@@ -50,16 +50,13 @@ pub fn cmd_reset_counters(argv: Vec<String>) -> Result<()> {
         .context("opening filesystem")?;
 
     unsafe {
-        let now = (*fs.raw).counters.now;
-
-        // zero counters (percpu is just a plain pointer in userspace)
         if to_reset.is_empty() {
             for i in 0..BCH_COUNTER_NR as usize {
-                *now.add(i) = 0;
+                c::bch2_counter_reset(fs.raw, i as u32);
             }
         } else {
             for &i in &to_reset {
-                *now.add(i) = 0;
+                c::bch2_counter_reset(fs.raw, i as u32);
             }
         }
 
@@ -70,3 +67,5 @@ pub fn cmd_reset_counters(argv: Vec<String>) -> Result<()> {
 
     Ok(())
 }
+
+pub const CMD: super::CmdDef = typed_cmd!("reset-counters", "Reset filesystem counters", Cli, cmd_reset_counters);

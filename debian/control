@@ -20,6 +20,7 @@ Build-Depends: debhelper-compat (= 13),
                libstd-rust-dev,
                libstd-rust-dev:native,
                libudev-dev,
+               libunwind-dev,
                liburcu-dev (>= 0.15),
                libzstd-dev,
                linux-libc-dev (>= 6.12),
@@ -41,6 +42,7 @@ Architecture: linux-any
 Depends: ${shlibs:Depends}, ${misc:Depends}, python3:any
 Recommends: bcachefs-kernel-dkms (= ${binary:Version}),
             initramfs-tools | linux-initramfs-tool,
+            mokutil,
 Breaks: bcachefs-kernel-dkms (<< ${binary:Version}),
         bcachefs-kernel-dkms (>> ${binary:Version}),
 Replaces: bcachefs-kernel-dkms (<< ${binary:Version}),
@@ -59,12 +61,16 @@ Package: bcachefs-kernel-dkms
 Architecture: linux-any
 Section: kernel
 Depends: ${misc:Depends},
+	 openssl,
+	 xz-utils,
 	 initramfs-tools | linux-initramfs-tool,
 	 linux-headers-generic (>= 6.16) |
+	 linux-headers-generic-hwe-24.04 (>= 6.16) |
 	 proxmox-headers-6.17 [amd64] |
 	 linux-headers-amd64 (>= 6.16) [amd64] | linux-headers-cloud-amd64 (>= 6.16) [amd64] | linux-headers-rt-amd64 (>= 6.16) [amd64] |
 	 linux-headers-arm64 (>= 6.16) [arm64] | linux-headers-cloud-arm64 (>= 6.16) [arm64] | linux-headers-rt-arm64 (>= 6.16) [arm64] |
-	 linux-headers-ppc64el (>= 6.16) [ppc64el] | linux-headers-cloud-ppc64el (>= 6.16) [ppc64el] | linux-headers-rt-ppc64el (>= 6.16) [ppc64el]
+	 linux-headers-ppc64el (>= 6.16) [ppc64el] | linux-headers-cloud-ppc64el (>= 6.16) [ppc64el] | linux-headers-rt-ppc64el (>= 6.16) [ppc64el] |
+	 linux-headers (>= 6.16)
 Pre-Depends: bcachefs-tools (= ${binary:Version}),
 Provides: bcachefs-kernel
 Description: bcachefs kernel module DKMS source

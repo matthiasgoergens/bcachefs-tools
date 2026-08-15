@@ -5,20 +5,22 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use bch_bindgen::fs::FsExt;
 use bch_bindgen::c::{
     self,
     bch_degraded_actions,
     bch_member_state::*,
-    bcachefs_metadata_version::bcachefs_metadata_version_reconcile,
     BCH_FORCE_IF_DATA_LOST, BCH_FORCE_IF_DEGRADED, BCH_FORCE_IF_METADATA_LOST,
 };
-use bch_bindgen::fs::Fs;
-use bch_bindgen::opt_set;
-use bch_bindgen::path_to_cstr;
+use bcachefs_kernel::fs::Fs;
+use bcachefs_kernel::metadata_version;
+use bcachefs_kernel::opt_set;
+use bcachefs_kernel::path_to_cstr;
 use clap::{Arg, ArgAction, Command, Parser, ValueEnum};
 
 use crate::commands::opts::{bch_opt_lookup, bch_option_args, bch_options_from_matches, parse_opt_val};
 use crate::device_multipath::{find_multipath_holder, warn_multipath_component};
+use crate::device_scan::OpenedFs;
 use crate::util::{fmt_sectors_human, parse_human_size};
 use crate::wrappers::accounting::{data_type_is_empty, data_type_is_hidden};
 use crate::wrappers::handle::BcachefsHandle;
@@ -28,14 +30,11 @@ fn device_add_opt_flags() -> u32 {
     c::opt_flags::OPT_FORMAT as u32 | c::opt_flags::OPT_DEVICE as u32
 }
 
-pub fn device_add_cmd() -> Command {
+fn device_add_cmd() -> Command {
     Command::new("add")
         .about("Add a new device to an existing filesystem")
-        .args(bch_option_args(device_add_opt_flags()))
-        .arg(Arg::new("label")
-            .short('l')
-            .long("label")
-            .help("Disk label"))
+        .args(bch_option_args(device_add_opt_flags(), false).into_iter()
+            .map(|a| if a.get_id() == "label" { a.short('l') } else { a }))
         .arg(Arg::new("force")
             .short('f')
             .long("force")
@@ -43,23 +42,40 @@ pub fn device_add_cmd() -> Command {
             .help("Use device even if it appears to already be formatted"))
         .arg(Arg::new("filesystem")
             .required(true)
-            .help("Filesystem path or mountpoint"))
+            .help("Filesystem path, mountpoint, or device"))
         .arg(Arg::new("device")
             .required(true)
             .help("Device to add"))
 }
 
-pub fn cmd_device_add(argv: Vec<String>) -> Result<()> {
+fn cmd_device_add(argv: Vec<String>) -> Result<()> {
     let matches = device_add_cmd().get_matches_from(argv);
 
     let fs_path = matches.get_one::<String>("filesystem").unwrap();
     let dev_path = matches.get_one::<String>("device").unwrap();
-    let label = matches.get_one::<String>("label");
     let force = matches.get_flag("force");
 
-    let handle = BcachefsHandle::open(fs_path)
-        .map_err(|e| anyhow!("opening filesystem '{}': {}", fs_path, e))?;
+    // Open the filesystem without starting it if it isn't mounted - same
+    // approach as 'bcachefs image update'; works even when the allocator
+    // is stuck and the filesystem can't mount normally:
+    let mut offline_opts: c::bch_opts = Default::default();
+    opt_set!(offline_opts, nostart, 1u8);
+    opt_set!(offline_opts, copygc_enabled, 0u8);
+    opt_set!(offline_opts, reconcile_enabled, 0u8);
 
+    match crate::device_scan::open_online_or_offline(&[PathBuf::from(fs_path)], offline_opts)
+	    .map_err(|e| anyhow!("opening filesystem '{}': {}", fs_path, e))? {
+        OpenedFs::Online(handle) => cmd_device_add_online(handle, dev_path, force, &matches),
+        OpenedFs::Offline(fs)    => cmd_device_add_offline(fs, dev_path, force, &matches),
+    }
+}
+
+fn cmd_device_add_online(
+    handle: BcachefsHandle,
+    dev_path: &str,
+    force: bool,
+    matches: &clap::ArgMatches,
+) -> Result<()> {
     let block_size = parse_human_size(
         &sysfs::read_sysfs_fd_str(handle.sysfs_fd(), "options/block_size")
             .context("reading block_size from sysfs")?,
@@ -69,55 +85,80 @@ pub fn cmd_device_add(argv: Vec<String>) -> Result<()> {
             .context("reading btree_node_size from sysfs")?,
     ).context("parsing btree_node_size")?;
 
-    // Build dev_opts with bch_opts from parsed arguments
-    let mut dev_opts: c::dev_opts = Default::default();
+    drop(device_add_format(dev_path, force, matches,
+        block_size as u32, btree_node_size as u32)?);
+    let c_dev_path = path_to_cstr(dev_path);
+    handle.disk_add(&c_dev_path)
+        .map_err(|e| anyhow!("adding device '{}': {}", dev_path, e))?;
+    crate::commands::format_util::trigger_udev_for_paths(&[dev_path]);
 
-    let c_path = CString::new(dev_path.as_str())?;
-    dev_opts.path = c_path.as_ptr();
+    Ok(())
+}
 
-    let c_label = label.map(|l| CString::new(l.as_str())).transpose()?;
-    if let Some(ref l) = c_label {
-        dev_opts.label = l.as_ptr();
-    }
+fn cmd_device_add_offline(
+    fs: Fs,
+    dev_path: &str,
+    force: bool,
+    matches: &clap::ArgMatches,
+) -> Result<()> {
+    let block_size = fs.opts().block_size as u32;
+    let btree_node_size = fs.opts().btree_node_size;
 
-    // Apply bcachefs options (--discard, --durability, etc.)
-    let bch_opts = bch_options_from_matches(&matches, device_add_opt_flags());
+    device_add_format(dev_path, force, matches,
+        block_size, btree_node_size)?;
+
+    fs.dev_add(dev_path)
+        .map_err(|e| anyhow!("adding device '{}': {}", dev_path, e))?;
+    crate::commands::format_util::trigger_udev_for_paths(&[dev_path]);
+
+    fs.start()
+        .map_err(|e| anyhow!("starting filesystem: {}", e))?;
+
+    Ok(())
+}
+
+fn device_add_format(
+    dev_path: &str,
+    force: bool,
+    matches: &clap::ArgMatches,
+    block_size: u32,
+    btree_node_size: u32,
+) -> Result<crate::commands::format_util::DevOpts> {
+    use crate::commands::format_util::DevOpts;
+
+    let mut dev_opts = DevOpts::new(CString::new(dev_path)?);
+
+    let bch_opts = bch_options_from_matches(matches, device_add_opt_flags());
     for (name, value) in &bch_opts {
         let Some((opt_id, opt)) = bch_opt_lookup(name) else { continue };
-        let val = parse_opt_val(opt, value)?
-            .ok_or_else(|| anyhow!("option {} requires open filesystem", name))?;
-        unsafe { c::bch2_opt_set_by_id(&mut dev_opts.opts, opt_id, val) };
+        match parse_opt_val(opt, value)? {
+            Some(val) => bcachefs_kernel::opts::opt_set_by_id(&mut dev_opts.opts, opt_id, val),
+            // Values that resolve against a superblock (labels) - the
+            // new device's sb, once format_for_device_add builds it:
+            None => dev_opts.opt_strs.push((opt_id, CString::new(value.as_str())?)),
+        }
     }
 
     if let Some(mpath_dev) = find_multipath_holder(Path::new(dev_path)) {
         warn_multipath_component(Path::new(dev_path), &mpath_dev);
         if !force {
-            // Locking applies to the selected device path only; it is not
-            // coordinated across dm-mpath maps and component devices.
-            // Selecting a component path may cause unintended data loss.
-            bail!("Use -f/--force to add anyway");
+            bail!("device appears to be a multipath component, use -f/--force to add anyway");
         }
     }
 
-    let ret = unsafe { c::open_for_format(&mut dev_opts, 0, force) };
-    if ret != 0 {
-        return Err(anyhow!("error opening {}: {}",
-            dev_path, std::io::Error::from_raw_os_error(-ret)));
-    }
+    dev_opts.open(0, force).map_err(|e| {
+        anyhow!("error opening {}: {}", dev_path, std::io::Error::from_raw_os_error(e))
+    })?;
 
-    let ret = crate::commands::format_util::bch2_format_for_device_add(
-        &mut dev_opts, block_size as u32, btree_node_size as u32,
+    let ret = crate::commands::format_util::format_for_device_add(
+        &mut dev_opts, block_size, btree_node_size,
     );
     if ret != 0 {
         return Err(anyhow!("error formatting {}: {}",
             dev_path, std::io::Error::from_raw_os_error(-ret)));
     }
 
-    let c_dev_path = path_to_cstr(dev_path);
-    handle.disk_add(&c_dev_path)
-        .map_err(|e| anyhow!("adding device '{}': {}", dev_path, e))?;
-
-    Ok(())
+    Ok(dev_opts)
 }
 
 /// Open a filesystem by block device path and return its handle + device index.
@@ -174,8 +215,7 @@ pub struct OnlineCli {
     device: String,
 }
 
-pub fn cmd_device_online(argv: Vec<String>) -> Result<()> {
-    let cli = OnlineCli::parse_from(argv);
+fn cmd_device_online(cli: OnlineCli) -> Result<()> {
 
     let handle = BcachefsHandle::open(&cli.device)
         .with_context(|| format!("opening filesystem for '{}'", cli.device))?;
@@ -196,8 +236,7 @@ pub struct OfflineCli {
     device: String,
 }
 
-pub fn cmd_device_offline(argv: Vec<String>) -> Result<()> {
-    let cli = OfflineCli::parse_from(argv);
+fn cmd_device_offline(cli: OfflineCli) -> Result<()> {
     let (handle, dev_idx) = open_dev(&cli.device)?;
 
     let flags = if cli.force { BCH_FORCE_IF_DEGRADED } else { 0 };
@@ -223,8 +262,7 @@ pub struct RemoveCli {
     path: Option<String>,
 }
 
-pub fn cmd_device_remove(argv: Vec<String>) -> Result<()> {
-    let cli = RemoveCli::parse_from(argv);
+fn cmd_device_remove(cli: RemoveCli) -> Result<()> {
 
     let mut flags = BCH_FORCE_IF_DEGRADED;
     if cli.force {
@@ -268,7 +306,7 @@ fn device_size(dev: &str) -> Result<u64> {
 }
 
 #[derive(Parser, Debug)]
-#[command(about = "Change the state of a device")]
+#[command(about = "Set a device state (rw, ro, evacuating, or spare)")]
 pub struct SetStateCli {
     /// Force if data redundancy will be degraded
     #[arg(short, long)]
@@ -282,7 +320,7 @@ pub struct SetStateCli {
     #[arg(short = 'o', long)]
     offline: bool,
 
-    /// Device state
+    /// New member state: rw, ro, evacuating, or spare
     #[arg(value_enum)]
     new_state: MemberState,
 
@@ -293,8 +331,7 @@ pub struct SetStateCli {
     path: Option<String>,
 }
 
-pub fn cmd_device_set_state(argv: Vec<String>) -> Result<()> {
-    let cli = SetStateCli::parse_from(argv);
+fn cmd_device_set_state(cli: SetStateCli) -> Result<()> {
 
     let new_state = cli.new_state.as_u32();
 
@@ -318,29 +355,30 @@ pub fn cmd_device_set_state(argv: Vec<String>) -> Result<()> {
 }
 
 fn set_state_offline(device: &str, new_state: u32) -> Result<()> {
-    use crate::wrappers::bch_err_str;
 
-    let c_path = CString::new(device)?;
     let mut opts: c::bch_opts = Default::default();
     opt_set!(opts, nostart, 1);
     opt_set!(opts, degraded, bch_degraded_actions::BCH_DEGRADED_very as u8);
 
     // Read superblock to get dev_idx
-    let mut sb_handle: c::bch_sb_handle = Default::default();
-    let ret = unsafe { c::bch2_read_super(c_path.as_ptr(), &mut opts, &mut sb_handle) };
-    if ret != 0 {
-        return Err(anyhow!("error opening {}: {}", device, bch_err_str(ret)));
-    }
-    let dev_idx = unsafe { (*sb_handle.sb).dev_idx as u32 };
-    unsafe { c::bch2_free_super(&mut sb_handle) };
+    let sb_handle = bch_bindgen::sb::io::read_super_opts(Path::new(device), opts)
+        .map_err(|e| anyhow!("error opening {}: {}", device, e))?;
+    let dev_idx = sb_handle.sb().dev_idx as u32;
+    drop(sb_handle);
 
     let fs = crate::device_scan::open_scan(&[PathBuf::from(device)], opts)
         .map_err(|e| anyhow!("Error opening filesystem: {}", e))?;
 
+    if fs.disk_sb().sb().sb_initialized() == 0 {
+        return Err(anyhow!("superblock not initialized (filesystem was never started): \
+                            bch2_write_super would silently skip the write; mount it once first"));
+    }
+
     {
         let _lock = fs.sb_lock();
-        unsafe { fs.members_v2_get_mut(dev_idx) }.set_member_state(new_state as u64);
-        fs.write_super();
+        unsafe { fs.member_mut(dev_idx) }.set_member_state(new_state as u64);
+        fs.write_super_force()
+            .map_err(|e| anyhow!("error writing superblock: {}", e))?;
     }
     Ok(())
 }
@@ -355,8 +393,7 @@ pub struct ResizeCli {
     size: Option<String>,
 }
 
-pub fn cmd_device_resize(argv: Vec<String>) -> Result<()> {
-    let cli = ResizeCli::parse_from(argv);
+fn cmd_device_resize(cli: ResizeCli) -> Result<()> {
 
     let size_bytes = match cli.size {
         Some(ref s) => parse_human_size(s)?,
@@ -371,14 +408,17 @@ pub fn cmd_device_resize(argv: Vec<String>) -> Result<()> {
             let usage = handle.dev_usage(dev_idx)
                 .context("querying device usage")?;
             let nbuckets = size_sectors / usage.bucket_size as u64;
-
-            if nbuckets < usage.nr_buckets {
-                return Err(anyhow!("Shrinking not supported yet"));
-            }
+            let shrinking = nbuckets < usage.nr_buckets;
 
             println!("resizing {} to {} buckets", cli.device, nbuckets);
             handle.disk_resize(dev_idx, nbuckets)
-                .context("resizing device")?;
+                .with_context(|| {
+                    if shrinking {
+                        "shrinking device (requires kernel shrink support)"
+                    } else {
+                        "resizing device"
+                    }
+                })?;
         }
         Err(_) if Path::new(&cli.device).exists() => {
             println!("Doing offline resize of {}", cli.device);
@@ -392,7 +432,7 @@ pub fn cmd_device_resize(argv: Vec<String>) -> Result<()> {
 
 /// Find the single online device in a filesystem.
 /// Offline operations (resize, resize-journal) require exactly one device.
-fn find_single_online_dev(fs: &Fs) -> Result<bch_bindgen::fs::DevRef> {
+fn find_single_online_dev(fs: &Fs) -> Result<bcachefs_kernel::fs::DevRef> {
     use std::ops::ControlFlow;
 
     let mut count = 0u32;
@@ -415,7 +455,7 @@ fn find_single_online_dev(fs: &Fs) -> Result<bch_bindgen::fs::DevRef> {
 }
 
 fn resize_offline(device: &str, size_sectors: u64) -> Result<()> {
-    use bch_bindgen::printbuf::Printbuf;
+    use bcachefs_kernel::util::printbuf::Printbuf;
 
     let opts: c::bch_opts = Default::default();
     let fs = crate::device_scan::open_scan(&[PathBuf::from(device)], opts)
@@ -452,8 +492,7 @@ pub struct ResizeJournalCli {
     size: String,
 }
 
-pub fn cmd_device_resize_journal(argv: Vec<String>) -> Result<()> {
-    let cli = ResizeJournalCli::parse_from(argv);
+fn cmd_device_resize_journal(cli: ResizeJournalCli) -> Result<()> {
 
     let size_bytes = parse_human_size(&cli.size)?;
     let size_sectors = size_bytes >> 9;
@@ -504,14 +543,13 @@ pub struct EvacuateCli {
     device: String,
 }
 
-pub fn cmd_device_evacuate(argv: Vec<String>) -> Result<()> {
-    let cli = EvacuateCli::parse_from(argv);
+fn cmd_device_evacuate(cli: EvacuateCli) -> Result<()> {
 
-    if bcachefs_kernel_version() < bcachefs_metadata_version_reconcile as u64 {
+    if bcachefs_kernel_version() < u32::from(metadata_version::reconcile) as u64 {
         return Err(anyhow!(
             "Kernel too old for Rust evacuate path; \
              need bcachefs metadata version >= {} (reconcile)",
-            bcachefs_metadata_version_reconcile as u64
+            u32::from(metadata_version::reconcile) as u64
         ));
     }
 
@@ -521,7 +559,7 @@ pub fn cmd_device_evacuate(argv: Vec<String>) -> Result<()> {
     // Reconcile drives evacuation — check the filesystem has been upgraded
     let sb_ver = handle.sb_version()
         .context("reading filesystem superblock")?;
-    if (sb_ver as u64) < bcachefs_metadata_version_reconcile as u64 {
+    if (sb_ver as u64) < u32::from(metadata_version::reconcile) as u64 {
         return Err(anyhow!(
             "Filesystem has not been upgraded to the reconcile version.\n\
              Device evacuation requires reconcile. Remount with:\n  \
@@ -565,3 +603,19 @@ pub fn cmd_device_evacuate(argv: Vec<String>) -> Result<()> {
         thread::sleep(Duration::from_secs(1));
     }
 }
+
+pub const CMD_ADD: super::CmdDef = raw_cmd!("add", "Add a device to a filesystem", cmd_device_add);
+pub const CMD_ONLINE: super::CmdDef = typed_cmd!("online", "Bring a device online", OnlineCli, cmd_device_online);
+pub const CMD_OFFLINE: super::CmdDef = typed_cmd!("offline", "Take a device offline", OfflineCli, cmd_device_offline);
+pub const CMD_REMOVE: super::CmdDef = typed_cmd!("remove", "Remove a device", RemoveCli, cmd_device_remove);
+pub const CMD_EVACUATE: super::CmdDef = typed_cmd!("evacuate", "Evacuate data from a device", EvacuateCli, cmd_device_evacuate);
+pub const CMD_SET_STATE: super::CmdDef = typed_cmd!("set-state", "Set device state", SetStateCli, cmd_device_set_state);
+pub const CMD_RESIZE: super::CmdDef = typed_cmd!("resize", "Resize filesystem on a device", ResizeCli, cmd_device_resize);
+pub const CMD_RESIZE_JOURNAL: super::CmdDef = typed_cmd!("resize-journal", "Resize journal on a device", ResizeJournalCli, cmd_device_resize_journal);
+pub const CMD: super::CmdDef = super::CmdDef {
+    name: "device", about: "Manage devices within a filesystem", aliases: &[],
+    kind: super::CmdKind::Group { children: &[
+        &CMD_ADD, &CMD_ONLINE, &CMD_OFFLINE, &CMD_REMOVE,
+        &CMD_EVACUATE, &CMD_SET_STATE, &CMD_RESIZE, &CMD_RESIZE_JOURNAL,
+    ]},
+};

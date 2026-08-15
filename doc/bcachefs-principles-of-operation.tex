@@ -6,15 +6,18 @@
 \usepackage{bookmark}
 \usepackage{longtable}
 \usepackage{upquote}
+\DeclareUnicodeCharacter{2194}{\ensuremath{\leftrightarrow}}
 
 % Include auto-generated fragments from bch-docgen.
 % Run: cargo run -p bch-docgen
 \newcommand{\bchdoc}[1]{\input{doc/generated/#1}}
+\providecommand{\bchdocversion}{unknown}
+\InputIfFileExists{doc/generated/build-version.tex}{}{}
 
 \title{bcachefs: Principles of Operation}
 \author{Kent Overstreet (and others)}
 
-\date{\today}
+\date{Revision \texttt{\bchdocversion}\\\today}
 
 \begin{document}
 
@@ -217,6 +220,92 @@ The complete list of recovery passes, in execution order:
 
 \bchdoc{recovery-passes}
 
+\subsection{Durability and fsync semantics}
+
+Because all metadata updates pass through a single, totally ordered journal,
+bcachefs provides a particularly simple crash recovery contract: \emph{prefix
+consistency}. The state recovered after a crash is exactly the state of the
+filesystem as of some recent moment $T$: every operation that completed before
+$T$ is present, every operation after $T$ is absent, and no other outcomes are
+possible. There is no reordering and no partial visibility --- recovery never
+shows operation $B$ without an operation $A$ that preceded it, whether or not
+the two were related. This is strictly stronger than the ``strictly ordered
+metadata consistency'' (SOMC) provided by ext4 and XFS, which promises ordering
+only between \emph{dependent} operations.
+
+\texttt{fsync(2)} constrains $T$: it completes the file's outstanding data
+writeback, then flushes the journal through the inode's most recent
+modification, guaranteeing $T$ is at least that point. Together with prefix
+consistency this gives fsync the following concrete meaning:
+
+\begin{itemize}
+\item Everything that ever modified the fsynced inode is persisted: writes,
+truncates, timestamps, extended attributes --- and link count changes, so an
+fsync of a file persists all of that file's hard link directory entries
+(creating or removing a hard link updates the inode in the same transaction as
+the directory entry).
+\item All operations system-wide that preceded the inode's last modification
+are also persisted, related to the fsynced file or not.
+\item An fsync of a directory persists all entry creations, removals and
+renames in that directory up to its last modification (directory entry
+updates modify the directory inode in the same transaction).
+\end{itemize}
+
+What is \emph{not} guaranteed: operations that occurred \emph{after} the
+fsynced inode's last modification, even if they preceded the fsync call
+itself. If file A is modified, then file B is modified, then A is fsynced,
+B's modification is not covered --- it will often be persisted anyway, because
+journal writes carry everything up to the journal's current position, but this
+is an accident of batching, not a promise. (Some filesystems' fsync
+implementations track fine-grained dependencies and may persist more, or less,
+in this situation; a number of xfstests in the crash-consistency family encode
+one such implementation's behavior rather than any standardized contract.)
+
+Data writes participate in the prefix property in normal (copy on write)
+operation: an extent is never journalled until the write of its data has
+completed, so if recovery shows an extent, the data it points to is intact.
+
+Exceptions, both opt-in:
+
+\begin{itemize}
+\item \texttt{lazytime}: timestamp-only updates are deliberately buffered in
+memory and may be lost on crash, up to the lazytime persistence points (sync,
+fsync, inode eviction, periodic expiry).
+\item \texttt{nocow}: data is overwritten in place, so the data prefix
+property is weakened --- after a crash, a nocow extent may contain newer data
+than moment $T$, and without checksums this cannot be detected.
+\end{itemize}
+
+The common write-temporary-then-rename-over pattern gets a stronger
+guarantee: when a rename \emph{overwrites} an existing file, bcachefs first
+completes writeback of the source file's data, so the data's extents are
+journalled before the rename is. Combined with prefix consistency this makes
+the replacement atomic and complete without any fsync: after a crash, either
+the old file is intact, or the rename happened and all of the new file's data
+is present --- the empty-or-truncated-file outcome cannot occur. Note this
+orders the rename behind the data but does not make the rename itself durable
+(no journal flush is issued); an application that must know the replacement
+has happened still needs fsync. Plain renames that don't overwrite anything
+get no implicit writeback.
+
+Related interfaces, briefly: \texttt{fdatasync(2)} is implemented
+identically to \texttt{fsync(2)} (stronger than POSIX requires).
+\texttt{syncfs(2)} and \texttt{sync(2)} flush the entire journal, making
+every operation completed before the call durable. \texttt{O\_DIRECT}
+confers no durability: completion means the data has been transferred to the
+device, but the extent describing it is journalled metadata like any other,
+so until a journal flush a crash simply recovers to a moment before the
+write. Crash semantics are identical to a buffered write whose writeback has
+completed; fsync or fdatasync is still what makes the write survive. The \texttt{O\_TMPFILE}-then-\texttt{linkat} pattern is
+covered by fsync's own-inode completeness: the link updates the inode, so a
+subsequent fsync of the file persists it. Finally, truncate-then-rewrite of an existing file
+(\texttt{O\_TRUNC}) is inherently unsafe as a replacement strategy on any
+filesystem: the old contents are destroyed before the new contents exist, so
+no placement of fsync can provide an old-or-new guarantee --- a crash after
+the truncate persists but before the rewrite does recovers an empty file,
+and fsync only narrows that window. Atomic replacement is what
+rename-over is for.
+
 \subsection{Bucket based allocation}
 
 As mentioned, bcachefs is descended from bcache, where the ability to efficiently
@@ -242,7 +331,7 @@ are partially empty (because the data they contained was overwritten) - copy GC
 evacuates buckets that are mostly empty by writing the data they contain to new
 buckets. This also means that we need to reserve space on the device for the
 copy GC reserve when formatting - 8\% by default (configurable from 5\% to
-21\%). A fragmentation LRU btree tracks bucket fill levels so that copygc can
+20\%). A fragmentation LRU btree tracks bucket fill levels so that copygc can
 find the most fragmented buckets directly instead of scanning the entire alloc
 btree.
 
@@ -341,8 +430,17 @@ shared structures that do not belong to any individual file. Encryption can
 only be enabled at format time; it cannot be added to an existing filesystem.
 
 \textbf{Critical exception}: Data written with the \texttt{nocow} option is
-stored \textbf{unencrypted}, even on an encrypted filesystem (see the Nocow
-section below).
+stored \textbf{unencrypted}, even on an encrypted filesystem. This is a hard
+design incompatibility, not a policy choice: ChaCha20 requires a unique nonce
+per (key, plaintext), and bcachefs stores the nonce externally alongside each
+data pointer. An in-place \texttt{nocow} overwrite cannot produce a new nonce
+without also atomically updating the pointer (which defeats the purpose of
+nocow), so the (key, nonce) pair would be reused against a different
+plaintext --- catastrophic for ChaCha20, since the XOR of two ciphertexts
+leaks the XOR of the plaintexts. Supporting encrypted nocow would require
+integrating a position-tweakable cipher (e.g.\ AES-XTS) alongside ChaCha20.
+See the Nocow section below and the Nonce reuse discussion for related
+considerations.
 
 The key hierarchy uses a passphrase (never stored on disk) to derive a
 passphrase key via scrypt, which decrypts a random master key stored in the
@@ -364,17 +462,31 @@ models. The \texttt{wide\_macs} option stores the full 128-bit MAC and is
 recommended when the storage device itself is untrusted (e.g. USB drives,
 network storage). Metadata always uses full-width MACs.
 
-\paragraph{Nonce reuse with external snapshots}
+\paragraph{Nonce reuse}
 
-If the underlying storage is snapshotted externally (LVM, ZFS zvol, VM
-snapshot) and the snapshot is mounted read-write, both instances share the
-same master key and will reuse nonces, breaking encryption security.
-bcachefs's own snapshots do not have this problem.
+ChaCha20 requires a unique nonce for every (key, plaintext) pair. bcachefs
+stores nonces externally (in the data pointer), so the filesystem itself
+assigns nonces --- and anything that breaks the ``one nonce per plaintext''
+invariant breaks encryption security. There are two distinct ways this can
+happen:
+
+\emph{External snapshots, mounted read-write}: if the underlying storage is
+snapshotted externally (LVM, ZFS zvol, VM snapshot) and the snapshot is
+mounted read-write, both instances share the same master key and will assign
+nonces independently, producing collisions. bcachefs's own snapshots do not
+have this problem.
 
 \textbf{Mitigation}: Never mount an external snapshot of an encrypted volume
 read-write --- keep external snapshots read-only (\texttt{-o nochanges}).
 Alternatively, place LUKS between the snapshot layer and bcachefs (e.g.
 LVM $\to$ LUKS $\to$ bcachefs).
+
+\emph{In-place overwrites (\texttt{nocow})}: in-place writes cannot update
+the externally-stored nonce without also updating the data pointer, which
+would defeat the point of nocow. Encrypting a nocow overwrite would therefore
+reuse the existing (key, nonce) against new plaintext. This is why nocow
+data on encrypted filesystems is stored in plaintext; see the Nocow section
+for details.
 
 See \hyperref[sec:encryption]{Encryption} in subsystem details for key
 hierarchy internals, keyring integration, and MAC storage details.
@@ -411,9 +523,21 @@ resume in-place.
 
 Because nocow data has no checksums, it cannot be verified by scrub, cannot be
 self-healed from a replica on checksum mismatch, and is not protected against
-bitrot. On encrypted filesystems, nocow data is stored in plaintext. These
-tradeoffs should be weighed carefully; for most workloads, the default COW
-behavior with checksumming is the better choice.
+bitrot.
+
+On encrypted filesystems, nocow data is stored in plaintext --- this is a
+hard incompatibility, not an oversight. ChaCha20 requires unique nonces, and
+bcachefs's nonces live in the data pointer (external to the ciphertext). An
+in-place overwrite therefore cannot change the nonce, so it would reuse the
+(key, nonce) pair against new plaintext, which leaks both plaintexts via
+keystream recovery. This also means subsystems that re-encrypt or re-emit
+data in the background (e.g.\ reconcile, background compression) must skip
+nocow extents; treating a nocow extent as encrypted is a correctness bug.
+Lifting this restriction would require adding a position-tweakable cipher
+(e.g.\ AES-XTS) to the encryption pipeline.
+
+These tradeoffs should be weighed carefully; for most workloads, the default
+COW behavior with checksumming is the better choice.
 
 \subsection{Multiple devices}
 
@@ -484,6 +608,10 @@ be unique). This gives us ways of referring to multiple devices in target
 options: If we specify ssd in a target option, that will refer to all devices
 with the label ssd or labels that start with ssd. (e.g. ssd.ssd1, ssd.ssd2).
 
+Device labels are used only for targeting. How replicas are spread across
+devices to survive hardware failures is a separate, per-device property; see
+\hyperref[sec:failure-domains]{Failure domains}.
+
 Four target options exist. All may be set at the filesystem level (at format
 time, at mount time, or at runtime via sysfs). All except
 \texttt{metadata\_target} may also be set on a particular file or directory:
@@ -514,20 +642,21 @@ there counts as two replicas.
 \paragraph{Tiered storage with replication}
 
 Replication interacts with targets naturally: the filesystem satisfies the
-configured \texttt{data\_replicas} count using durability-weighted copies,
-regardless of which target they are on. For example, with
-\texttt{data\_replicas=2}, \texttt{foreground\_target=ssd}, and
+configured \texttt{data\_replicas} count using durability-weighted copies.
+Foreground writes place all of the required durable copies on the foreground
+target; the reconcile subsystem then moves them to the background target. For
+example, with \texttt{data\_replicas=2}, \texttt{foreground\_target=ssd}, and
 \texttt{background\_target=hdd}:
 
 \begin{itemize}
-\item Data is initially written to the SSD target
-\item The background mover copies it to the HDD target
-\item Since both SSD and HDD copies have \texttt{durability=1} by default,
-  each counts as one replica---the two copies together satisfy the replica
-  requirement
-\item To use the SSDs as a pure write cache (data evictable once on HDD),
-  set \texttt{durability=0} on the SSD devices; the allocator will then
-  write two durable copies on the HDD target
+\item Foreground writes place both durable copies on the SSD target, assuming
+  the SSD devices have enough total durability for \texttt{data\_replicas}
+\item Reconcile then moves those copies to the HDD target---both replicas end
+  up on the HDD target, not split one per tier
+\item The SSD retains a copy only as a cache: set \texttt{promote\_target=ssd}
+  to keep a cached copy there for fast reads (added on read, not counted as a
+  replica, and evicted in LRU order under space pressure), or set
+  \texttt{durability=0} on the SSD devices to use them as a pure write cache
 \end{itemize}
 
 See \hyperref[sec:devices]{Device management} in subsystem details for
@@ -688,6 +817,30 @@ disks. \texttt{bcachefs image update} incrementally updates an existing image
 to reflect changes in the source directory, minimizing the amount of data
 rewritten.
 
+\section{Compatibility and versioning}
+
+The on-disk format gains features from release to release, with two
+compatibility guarantees that keep upgrading --- and going back --- predictable.
+
+Forwards: a newer release can always mount a filesystem an older release made.
+It upgrades the format while mounting, by running the recovery passes that bring
+the metadata up to date --- automatically, with nothing asked of you. It is
+worth knowing this happens: the format is updated in place, so once you mount
+with a newer release the filesystem is on the newer format. (Support for the
+very oldest formats is eventually dropped, so a very large version gap may need
+an intermediate release.)
+
+Backwards, by default: an older release can still mount and use a filesystem a
+newer release has touched. The exception is an \emph{incompatible} upgrade, which
+you ask for explicitly with \texttt{version\_upgrade=incompatible}; it turns on
+newer format features older releases cannot read, and so is a one-way step ---
+until you run \texttt{bcachefs downgrade}, which runs the recovery passes that
+convert the filesystem back to a form an older release accepts.
+
+So: upgrading is automatic and, by default, never costs you the ability to go
+back; only an explicit incompatible upgrade does, and \texttt{bcachefs downgrade}
+undoes even that.
+
 \section{Management}
 
 \subsection{Formatting}
@@ -742,6 +895,33 @@ would be missing.
 
 The \texttt{-o verbose} option enables additional log output during the mount
 process.
+
+\subsubsection{Mounting at boot}
+
+At boot the system may attempt to mount a multi device filesystem before udev
+has finished probing all of its component devices. Since mounting normally
+requires every device to be present, this is a race: the mount can fail
+reporting missing devices even though they are all attached, simply because
+some had not been probed yet when the mount was attempted.
+
+bcachefs-tools ships a templated systemd service to close this race,
+\texttt{bcachefs-wait-devices@.service}, which runs \texttt{bcachefs
+wait-devices UUID=<uuid>}. It uses udev to watch the block subsystem and does
+not complete until every device belonging to the filesystem has been
+initialized. Make the mount depend on it by adding to the fstab entry's mount
+options
+\begin{quote} \begin{verbatim}
+x-systemd.requires=bcachefs-wait-devices@<uuid>.service
+\end{verbatim} \end{quote}
+where \texttt{<uuid>} is the filesystem UUID---the \texttt{@} instance is passed
+through to \texttt{wait-devices} as the UUID to wait for. systemd then holds the
+mount until all of the filesystem's devices have appeared.
+
+Because the service waits for \emph{every} member device, it should not be
+combined with \texttt{-o degraded} when a device is permanently missing: the
+service would never complete and the mount would time out. Use the wait service
+for the normal, all-devices-present case, and \texttt{degraded} without the
+requirement when intentionally mounting a filesystem that is missing a device.
 
 \subsection{Monitoring}
 
@@ -919,6 +1099,58 @@ persistent count in the superblock's errors section. These counts survive
 across reboots and accumulate over the filesystem's lifetime, providing an
 audit trail of what has been detected and repaired. The counts are visible in
 \texttt{bcachefs show-super} output and via the sysfs \texttt{errors} file.
+
+\subsection{Safety mechanisms}
+\label{sec:safety-mechanisms}
+
+\subsubsection{Subvolumes and snapshots must agree}
+
+A subvolume names the snapshot it is the live view of; that snapshot names the
+subvolume back. Both are required:
+
+\begin{itemize}
+\item Snapshot deletion will not reclaim a snapshot marked \texttt{will\_delete}
+  unless a subvolume still points at it.
+\item \texttt{check\_inodes} will not reconstruct a missing subvolume key unless
+  the root inode's \texttt{bi\_subvol} names it \emph{and} the snapshot that inode
+  lives at names the same subvolume back. If only one of the two says so,
+  \texttt{bi\_subvol} is cleared instead of a subvolume being invented.
+\end{itemize}
+
+Inodes and dirents reference each other the same way: an inode's
+\texttt{bi\_dir} and \texttt{bi\_dir\_offset} locate its dirent, and the dirent
+names the inode. Extents and the alloc btree are checked against each other
+through \hyperref[sec:backpointers]{backpointers}. Snapshot parent and child
+pointers must agree in both directions.
+
+\subsubsection{Every key implies an inode key at its snapshot}
+
+An extent, dirent or xattr in snapshot $X$ requires a key in the inodes btree at
+$X$ for the same inode number --- an inode or a whiteout, either will do.
+
+Snapshot deletion relies on this to find keys: it walks the inodes btree and
+descends into an inode's other btrees only where it finds a key at a dying
+snapshot. A content key whose snapshot has no inodes-btree key is never
+reached, so it is never migrated. The content passes enforce the requirement,
+which is why they run before deletion.
+
+\subsubsection{Accounting}
+
+Accounting counters are maintained by triggers as keys are committed, not by
+walking the btrees, so they are arrived at independently of the keys they
+count. Snapshot deletion checks them twice:
+
+\begin{itemize}
+\item It will not delete a dying snapshot's inode keys unless accounting reads
+  zero for that snapshot's extents, dirents and xattrs --- deleting them
+  destroys the index above, so anything left would become unreachable.
+\item It will not empty or remove a node unless accounting reads zero for it.
+\end{itemize}
+
+Either refusal schedules the content pass for the btree still holding data,
+which repairs the missing inode key so the next run can find it.
+\texttt{check\_allocations} rebuilds accounting from a full mark of the btrees,
+which is how a stale counter is told from keys that really are still there.
 
 \subsection{Fsck}
 
@@ -1131,6 +1363,55 @@ When investigating damage before attempting repair:
   offline analysis, without including user data. For encrypted filesystems,
   the passphrase must first be removed with \texttt{bcachefs remove-passphrase}.
 \end{description}
+
+\subsubsection{Extent poisoning and data recovery}
+
+When a read detects a checksum mismatch and no valid replica exists to serve
+the read from, the extent is marked \emph{poisoned}. Subsequent reads of a
+poisoned extent return an error immediately without going to disk, preventing
+applications from silently consuming corrupt data.
+
+Poisoning is persistent: it survives remounts and data moves. When a poisoned
+extent is moved (by reconcile, copygc, or tiering), the filesystem must
+compute a new checksum over the data at its new location. Because the data is
+corrupt, the new checksum is valid for the corrupt data. The poison flag is how
+the filesystem remembers that the data was known-bad before the move---without
+it, the new checksum would pass and the corruption would become invisible.
+
+\paragraph{Inspecting poisoned data.}
+The \texttt{bcachefs data-read} command performs an O\_DIRECT read with
+extended error reporting. It reports errors via a bitmask (checksum, IO,
+decompression, erasure coding reconstruction) and detailed kernel error
+messages.
+
+\begin{verbatim}
+# Read with error diagnostics
+bcachefs data-read /path/to/file --offset 0 --len 4096
+
+# Read poisoned data (bypasses poison check)
+bcachefs data-read /path/to/file --no-poison-check
+
+# Save recovered data to a file
+bcachefs data-read /path/to/file --no-poison-check --output recovered.bin
+\end{verbatim}
+
+With \texttt{--no-poison-check}, the command bypasses the poison check and
+returns whatever data is on disk. The errors bitmask will include
+\texttt{checksum} to indicate that the extent was poisoned.
+
+\paragraph{Clearing poison flags.}
+If the data has been verified as acceptable (or restored from backup), the
+\texttt{bcachefs unpoison} command clears the poison flag:
+
+\begin{verbatim}
+bcachefs unpoison /path/to/file --yes-i-understand
+\end{verbatim}
+
+The \texttt{--yes-i-understand} flag is required because unpoisoning removes
+the only indication that the data is bad. After unpoisoning, normal reads
+return the data without errors, even if it is corrupt. This is appropriate
+when the data is usable despite corruption (e.g.\ a media file with minor
+artifacts) or when the file has been restored from backup.
 
 \section{Command reference}
 
@@ -1416,6 +1697,11 @@ not recover from and need attention from the developers, this makes it possible
 to send the developers only the required metadata. Encrypted filesystems must
 first be unlocked with \texttt{bcachefs remove-passphrase}.
 
+\subsection{kvdb: the btree REPL}
+\label{sec:kvdb}
+
+\bchdoc{kvdb}
+
 \section{Subsystem details}
 
 \subsection{Data paths}
@@ -1425,9 +1711,18 @@ the filesystem.
 
 \bchdoc{data-paths}
 
+\subsubsection{Extent checksums and compression}
+
+\bchdoc{extent-checksums}
+
 \subsection{Allocator}
 
 \bchdoc{allocator}
+
+\subsection{Failure domains}
+\label{sec:failure-domains}
+
+\bchdoc{failure-domains}
 
 \subsection{Subvolumes and snapshots}
 \label{sec:snapshots}
@@ -1458,6 +1753,11 @@ index and journal bucket locations.
 \label{sec:btrees}
 
 \bchdoc{btrees}
+
+\subsection{Erasure coding}
+\label{sec:erasure-coding}
+
+\bchdoc{erasure-coding}
 
 \section{ioctl interface}
 
@@ -1610,6 +1910,13 @@ efficient bulk insertion; this sort-merge-sweep is inherently single-threaded,
 making its efficiency critical for multithreaded workloads.
 
 \subsection{Btree keys}
+
+\bchdoc{bkey-structures}
+
+See \S\ref{bkey-type-list} for the complete list of key types.
+
+\subsection{Btree key types}
+\label{bkey-type-list}
 
 \bchdoc{bkey-types}
 

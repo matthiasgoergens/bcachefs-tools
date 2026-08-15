@@ -1,23 +1,156 @@
 use std::{
-    ffi::{CString, OsString},
+    ffi::{CStr, CString, OsString},
     io::{stdout, IsTerminal},
     os::unix::ffi::OsStringExt,
     path::{Path, PathBuf},
     ptr, str,
 };
 
-use anyhow::{ensure, Result};
-use bch_bindgen::{bcachefs, bcachefs::bch_sb_handle, path_to_cstr};
+use anyhow::{ensure, Context, Result};
+use bcachefs_kernel::c::bch_sb_handle;
+use bcachefs_kernel::path_to_cstr;
 use clap::Parser;
 use log::{debug, error, info};
 use crate::device_scan;
 
 use crate::{
+    fs_context::{self, FsContext, Level, Message},
     key::{KeyHandle, Keyring, Passphrase, UnlockPolicy},
     logging,
 };
 
+/// What came of an attempt on the fs_context path.
+enum Mounted {
+    /// Mounted.
+    Yes,
+    /// The kernel has no fsopen(2); the caller should use mount(2).
+    NoNewApi,
+    /// The device is write-protected and a read-write mount wasn't explicitly
+    /// asked for. mount(8) retries these read-only rather than failing.
+    WriteProtected,
+}
+
+/// Show warnings and notices; return the error-level messages so the caller can
+/// fold them into its error, where they'll be reported exactly once.
+fn report_log(msgs: Vec<Message>) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    for m in msgs {
+        match m.level {
+            Level::Error   => errors.push(m.text),
+            Level::Warning => eprintln!("mount: warning: {}", m.text),
+            Level::Notice  => info!("{}", m.text),
+        }
+    }
+
+    errors
+}
+
+/// Mount via the fs_context API, so that whatever bcachefs has to say about a
+/// failure reaches the user instead of being flattened to an errno.
+fn mount_fs_context(
+    src: &str,
+    target: &CStr,
+    fstype: &str,
+    mountflags: libc::c_ulong,
+    data: Option<&str>,
+) -> anyhow::Result<Mounted> {
+    let Some(fc) = FsContext::open(fstype).with_context(|| format!("fsopen({fstype})"))? else {
+        debug!("no fs_context mount API, falling back to mount(2)");
+        return Ok(Mounted::NoNewApi);
+    };
+
+    // The kernel's account of a failure is the entire reason for being here, so
+    // it becomes the error rather than being printed alongside one.
+    let fail = |fc: &FsContext, what: String, err: std::io::Error| -> anyhow::Error {
+        match report_log(fc.drain_log()) {
+            e if e.is_empty() => anyhow::anyhow!("{what}: {err}"),
+            errors            => anyhow::anyhow!("{what}: {}", errors.join("; ")),
+        }
+    };
+
+    fc.set("source", Some(src))
+        .map_err(|e| fail(&fc, format!("source {src}"), e))?;
+
+    for name in fs_context::sb_flag_params(mountflags) {
+        fc.set(name, None)
+            .map_err(|e| fail(&fc, format!("option {name}"), e))?;
+    }
+
+    // One at a time, so a rejected option is named in the error.
+    for opt in data.unwrap_or("").split(',').filter(|o| !o.is_empty()) {
+        let (key, value) = match opt.split_once('=') {
+            Some((k, v)) => (k, Some(v)),
+            None         => (opt, None),
+        };
+
+        fc.set(key, value)
+            .map_err(|e| fail(&fc, format!("option {opt}"), e))?;
+    }
+
+    info!("creating superblock");
+    if let Err(e) = fc.create() {
+        // Write-protected device: retry read-only, as mount(8) does. Say nothing
+        // yet - the retry produces the real outcome, and this context's log dies
+        // with it.
+        if matches!(e.raw_os_error(), Some(libc::EACCES | libc::EROFS))
+            && mountflags & libc::MS_RDONLY == 0
+        {
+            return Ok(Mounted::WriteProtected);
+        }
+
+        return Err(fail(&fc, "mount".to_string(), e));
+    }
+
+    // A mount can succeed and still have things to say - degraded, recovery
+    // notes - so drain the log here too.
+    report_log(fc.drain_log());
+
+    let mnt = fc
+        .fsmount(fs_context::mount_attrs(mountflags))
+        .map_err(|e| fail(&fc, "fsmount".to_string(), e))?;
+
+    fs_context::move_mount(&mnt, target)
+        .with_context(|| format!("attaching to {}", target.to_string_lossy()))?;
+
+    Ok(Mounted::Yes)
+}
+
 fn mount_inner(
+    src: OsString,
+    target: &std::path::Path,
+    fstype: &str,
+    mountflags: libc::c_ulong,
+    data: Option<String>,
+) -> anyhow::Result<()> {
+    // Reconfiguring an existing mount is fspick(2) + FSCONFIG_CMD_RECONFIGURE,
+    // which fs_context doesn't implement; leave remount on mount(2).
+    //
+    // A device path that isn't UTF-8 also goes the old way rather than being
+    // lossily mangled into one: mount(2) takes arbitrary bytes.
+    if mountflags & libc::MS_REMOUNT == 0 {
+        if let Some(src_str) = src.to_str() {
+            let c_target = path_to_cstr(target);
+            let mut flags = mountflags;
+
+            loop {
+                info!("mounting filesystem");
+                match mount_fs_context(src_str, &c_target, fstype, flags, data.as_deref())? {
+                    Mounted::Yes      => return Ok(()),
+                    Mounted::NoNewApi => break,
+                    Mounted::WriteProtected => {
+                        println!("mount: device write-protected, mounting read-only");
+                        flags |= libc::MS_RDONLY;
+                    }
+                }
+            }
+        }
+    }
+
+    mount_legacy(src, target, fstype, mountflags, data)
+}
+
+fn mount_legacy(
     src: OsString,
     target: &std::path::Path,
     fstype: &str,
@@ -75,52 +208,92 @@ fn mount_inner(
     }
 }
 
-/// Parse a comma-separated mount options and split out mountflags and filesystem
-/// specific options.
-fn parse_mountflag_options(options: impl AsRef<str>) -> (Option<String>, libc::c_ulong) {
-    use either::Either::{Left, Right};
+/// A comma-separated mount option string split into its consumers.
+///
+/// The same option vocabulary feeds three places - the mount(2) syscall
+/// (`flags`), the FUSE mount (`fuse_options`), and the filesystem itself
+/// (`fs_opts`, handed to parse_mount_opts later) - so it's tabulated once in
+/// [`parse_mountflag_options`] rather than re-derived per caller.
+#[derive(Default)]
+pub(crate) struct ParsedMountOptions {
+    /// Filesystem-specific options: everything not consumed as a kernel flag.
+    pub fs_opts:      Option<String>,
+    /// Kernel mount flags for mount(2).
+    pub flags:        libc::c_ulong,
+    /// `flags` expressed as fuser options, for the FUSE path. Flags with no
+    /// fuser equivalent are omitted here but still apply via `flags`.
+    #[cfg(feature = "fuse")]
+    pub fuse_options: Vec<fuser::MountOption>,
+}
 
+/// Parse a comma-separated mount option string, splitting kernel mount flags
+/// (and their fuser equivalents) from filesystem-specific options.
+pub(crate) fn parse_mountflag_options(options: impl AsRef<str>) -> ParsedMountOptions {
     debug!("parsing mount options: {}", options.as_ref());
-    let (opts, flags) = options
-        .as_ref()
-        .split(',')
-        .map(|o| match o {
-            "dirsync" => Left(libc::MS_DIRSYNC),
-            "lazytime" => Left(1 << 25), // MS_LAZYTIME
-            "mand" => Left(libc::MS_MANDLOCK),
-            "noatime" => Left(libc::MS_NOATIME),
-            "nodev" => Left(libc::MS_NODEV),
-            "nodiratime" => Left(libc::MS_NODIRATIME),
-            "noexec" => Left(libc::MS_NOEXEC),
-            "nosuid" => Left(libc::MS_NOSUID),
-            "relatime" => Left(libc::MS_RELATIME),
-            "remount" => Left(libc::MS_REMOUNT),
-            "ro" => Left(libc::MS_RDONLY),
-            "rw" | "" => Left(0),
-            "strictatime" => Left(libc::MS_STRICTATIME),
-            "sync" => Left(libc::MS_SYNCHRONOUS),
-            // Userspace-only fstab options — not passed to the kernel
-            "auto" | "noauto" | "nofail" | "_netdev" |
-            "user" | "nouser" | "users" | "group" | "owner" => Left(0),
-            o if o.starts_with("x-") || o.starts_with("comment=") => Left(0),
-            o => Right(o),
-        })
-        .fold((Vec::new(), 0), |(mut opts, flags), next| match next {
-            Left(f) => (opts, flags | f),
-            Right(o) => {
-                opts.push(o);
-                (opts, flags)
-            }
-        });
 
-    (
-        if opts.is_empty() {
-            None
-        } else {
-            Some(opts.join(","))
-        },
-        flags,
-    )
+    let mut parsed = ParsedMountOptions::default();
+    let mut fs_opts: Vec<&str> = Vec::new();
+
+    // A kernel flag, optionally paired with its fuser option. The fuser arm is
+    // only referenced under the `fuse` feature, so its tokens must live inside
+    // the cfg - hence the macro rather than a plain match value.
+    macro_rules! flag {
+        ($ms:expr) => {{ parsed.flags |= $ms; }};
+        ($ms:expr, $fuse:expr) => {{
+            parsed.flags |= $ms;
+            #[cfg(feature = "fuse")]
+            parsed.fuse_options.push($fuse);
+        }};
+    }
+
+    for opt in options.as_ref().split(',') {
+        match opt {
+            "dirsync"     => flag!(libc::MS_DIRSYNC, fuser::MountOption::DirSync),
+            "lazytime"    => flag!(fs_context::MS_LAZYTIME),
+            "mand"        => flag!(libc::MS_MANDLOCK),
+            "noatime"     => flag!(libc::MS_NOATIME, fuser::MountOption::NoAtime),
+            "nodev"       => flag!(libc::MS_NODEV, fuser::MountOption::NoDev),
+            "nodiratime"  => flag!(libc::MS_NODIRATIME),
+            "noexec"      => flag!(libc::MS_NOEXEC, fuser::MountOption::NoExec),
+            "nosuid"      => flag!(libc::MS_NOSUID, fuser::MountOption::NoSuid),
+            "relatime"    => flag!(libc::MS_RELATIME),
+            "remount"     => flag!(libc::MS_REMOUNT),
+            "ro"          => flag!(libc::MS_RDONLY, fuser::MountOption::RO),
+            "rw" | ""     => {}
+            "strictatime" => flag!(libc::MS_STRICTATIME),
+            "sync"        => flag!(libc::MS_SYNCHRONOUS, fuser::MountOption::Sync),
+            // Userspace-only fstab options - not passed to the kernel:
+            "auto" | "noauto" | "nofail" | "_netdev"
+            | "user" | "nouser" | "users" | "group" | "owner" => {}
+            o if o.starts_with("x-") || o.starts_with("comment=") => {}
+            o => fs_opts.push(o),
+        }
+    }
+
+    parsed.fs_opts = (!fs_opts.is_empty()).then(|| fs_opts.join(","));
+    parsed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_mountflag_options;
+
+    #[test]
+    fn parse_mountflag_options_splits_kernel_and_fs_options() {
+        let p = parse_mountflag_options("ro,noexec,metadata_replicas=2,norecovery");
+
+        assert_eq!(p.fs_opts.as_deref(), Some("metadata_replicas=2,norecovery"));
+        assert_ne!(p.flags & libc::MS_RDONLY, 0);
+        assert_ne!(p.flags & libc::MS_NOEXEC, 0);
+    }
+
+    #[test]
+    fn parse_mountflag_options_drops_userspace_fstab_options() {
+        let p = parse_mountflag_options("nofail,_netdev,x-systemd.device-timeout=5");
+
+        assert_eq!(p.fs_opts, None);
+        assert_eq!(p.flags, 0);
+    }
 }
 
 /// If a user explicitly specifies `unlock_policy` or `passphrase_file` then use
@@ -132,17 +305,31 @@ fn handle_unlock(cli: &Cli, sb: &bch_sb_handle) -> Result<KeyHandle> {
     }
 
     if let Some(path) = cli.passphrase_file.as_deref() {
-        return Passphrase::new_from_file(path).and_then(|p| KeyHandle::new(sb, &p, Keyring::User));
+        let passphrase_correct = Passphrase::read_from_file(path)?
+            .check(sb)
+            .ok_or_else(|| anyhow::anyhow!("incorrect passphrase"))?;
+        return KeyHandle::new(&passphrase_correct, Keyring::User);
     }
 
     let uuid = sb.sb().uuid();
-    KeyHandle::new_from_search(&uuid)
-        .or_else(|_| Passphrase::new(&uuid).and_then(|p| KeyHandle::new(sb, &p, Keyring::User)))
+    if let Ok(handle) = KeyHandle::new_from_search(&uuid) {
+        return Ok(handle);
+    }
+
+    let passphrase_correct = Passphrase::ask_and_check(sb)?;
+    KeyHandle::new(&passphrase_correct, Keyring::User)
 }
 
 fn cmd_mount_inner(cli: &Cli) -> Result<()> {
-    let (optstr, mountflags) = parse_mountflag_options(&cli.options);
-    let opts = bch_bindgen::opts::parse_mount_opts(None, optstr.as_deref(), true)
+    if cli.no_mtab {
+        debug!("ignoring -n/--no-mtab; mount.bcachefs does not update /etc/mtab");
+    }
+    if cli.sloppy {
+        debug!("ignoring -s/--sloppy; bcachefs already ignores unrecognized options");
+    }
+
+    let parsed = parse_mountflag_options(&cli.options);
+    let opts = bcachefs_kernel::opts::parse_mount_opts(None, parsed.fs_opts.as_deref(), true)
         .unwrap_or_default();
 
     let sbs = device_scan::scan_sbs(&cli.dev, &opts)?;
@@ -152,13 +339,21 @@ fn cmd_mount_inner(cli: &Cli) -> Result<()> {
     let devices = device_scan::joined_device_str(&sbs);
 
     let first_sb = &sbs[0].1;
-    if unsafe { bcachefs::bch2_sb_is_encrypted(first_sb.sb) } {
+    if unsafe { bch_bindgen::c::bch2_sb_is_encrypted(first_sb.sb) } {
         handle_unlock(cli, first_sb)?;
     }
 
     drop(sbs);
 
     if let Some(mountpoint) = cli.mountpoint.as_deref() {
+        if cli.fake {
+            info!(
+                "fake mount (-f/--fake): skipping the mount syscall for {}",
+                mountpoint.to_string_lossy()
+            );
+            return Ok(());
+        }
+
         info!(
             "mounting with params: device: {:?}, target: {}, options: {}",
             devices,
@@ -166,7 +361,7 @@ fn cmd_mount_inner(cli: &Cli) -> Result<()> {
             &cli.options
         );
 
-        mount_inner(devices, mountpoint, "bcachefs", mountflags, optstr)
+        mount_inner(devices, mountpoint, "bcachefs", parsed.flags, parsed.fs_opts)
     } else {
         info!(
             "would mount with params: device: {:?}, options: {}",
@@ -177,15 +372,19 @@ fn cmd_mount_inner(cli: &Cli) -> Result<()> {
     }
 }
 
-/// Mount a bcachefs filesystem by its UUID.
+/// Mount a bcachefs filesystem by its UUID or label.
 #[derive(Parser, Debug)]
 #[command(author, version, about,
-    long_about = "Mounts a bcachefs filesystem. Devices are discovered automatically \
-by scanning for the filesystem UUID---unlike btrfs, this is handled \
+    long_about = "`mount -t bcachefs` invokes the installed mount.bcachefs helper; \
+this is the same mount path exposed as `bcachefs mount`.\n\n\
+Mounts a bcachefs filesystem. Devices are discovered automatically \
+by scanning for the filesystem UUID or label---unlike btrfs, this is handled \
 entirely in userspace.\n\n\
+Use OLD_BLKID_UUID=<uuid> in fstab entries when systemd consumes \
+UUID=<uuid> before the bcachefs mount helper can scan all members.\n\n\
 If the filesystem is encrypted, the passphrase will be looked up in \
 the kernel keyring first; if not found, the user is prompted \
-interactively (or reads from stdin if not a terminal). Use -k or -f \
+interactively (or reads from stdin if not a terminal). Use -k or --passphrase-file \
 to specify alternative unlock methods.")]
 pub struct Cli {
     /// Path to passphrase file
@@ -193,7 +392,7 @@ pub struct Cli {
     /// This can be used to optionally specify a file to read the passphrase
     /// from. An explictly specified key_location/unlock_policy overrides this
     /// argument.
-    #[arg(short = 'f', long)]
+    #[arg(long)]
     passphrase_file: Option<PathBuf>,
 
     /// Passphrase policy to use in case of an encrypted filesystem. If not
@@ -203,7 +402,7 @@ pub struct Cli {
     #[arg(short = 'k', long = "key_location", value_enum)]
     unlock_policy: Option<UnlockPolicy>,
 
-    /// Device, or UUID=\<UUID\>
+    /// Device, UUID=\<UUID\>, OLD_BLKID_UUID=\<UUID\> (fstab), or LABEL=\<label\>
     dev: String,
 
     /// Where the filesystem should be mounted. If not set, then the filesystem
@@ -214,6 +413,19 @@ pub struct Cli {
     /// Mount options
     #[arg(short, default_value = "")]
     options: String,
+
+    /// Do not update /etc/mtab; accepted for mount(8) compatibility
+    #[arg(short = 'n', long = "no-mtab")]
+    no_mtab: bool,
+
+    /// Fake mount: do everything except the mount syscall (mount(8) -f)
+    #[arg(short = 'f', long)]
+    fake: bool,
+
+    /// Ignore unrecognized mount options instead of failing (mount(8) -s).
+    /// bcachefs already ignores unknown options, so this is accepted as a no-op.
+    #[arg(short = 's', long)]
+    sloppy: bool,
 
     #[arg(short = 't', long = "type", default_value = "")]
     fs_type: String,
@@ -228,47 +440,57 @@ pub struct Cli {
     verbose: u8,
 }
 
-fn check_bcachefs_module() -> bool {
-    let path = Path::new("/sys/module/bcachefs");
-
-    path.exists() || {
-        let _ = std::process::Command::new("modprobe")
-            .arg("bcachefs")
-            .status();
-        path.exists()
-    }
+struct ModuleCheck {
+    loaded:         bool,
+    modprobe_error: Option<String>,
 }
 
-pub fn mount(mut argv: Vec<String>, symlink_cmd: Option<&str>) -> std::process::ExitCode {
-    let module_loaded = check_bcachefs_module();
-
-    // If the bcachefs tool is being called as "bcachefs mount dev ..." (as opposed to via a
-    // symlink like "/usr/sbin/mount.bcachefs dev ...", then we need to pop the 0th argument
-    // ("bcachefs") since the CLI parser here expects the device at position 1.
-    if symlink_cmd.is_none() {
-        argv.remove(0);
+fn check_bcachefs_module() -> ModuleCheck {
+    let path = Path::new("/sys/module/bcachefs");
+    if path.exists() {
+        return ModuleCheck { loaded: true, modprobe_error: None };
     }
 
-    let cli = Cli::parse_from(argv.clone());
+    let modprobe_error = match std::process::Command::new("modprobe").arg("bcachefs").status() {
+        Ok(s) if s.success() => None,
+        Ok(_)  => Some("modprobe bcachefs exited unsuccessfully".to_string()),
+        Err(e) => Some(format!("could not run modprobe bcachefs: {e}")),
+    };
+
+    ModuleCheck { loaded: path.exists(), modprobe_error }
+}
+
+fn mount(cli: Cli) -> std::process::ExitCode {
+    let module = check_bcachefs_module();
 
     if cli.fs_type == "bcachefs.fuse" {
-        // Build argv for fusemount from mount's parsed args
-        let mut fuse_argv = vec!["fusemount".to_string()];
-        if !cli.options.is_empty() {
-            fuse_argv.push("-o".to_string());
-            fuse_argv.push(cli.options.clone());
+        if cli.fake {
+            info!("fake mount (-f/--fake): skipping FUSE mount");
+            return std::process::ExitCode::SUCCESS;
         }
-        fuse_argv.push(cli.dev.clone());
-        if let Some(mp) = cli.mountpoint.as_ref() {
-            fuse_argv.push(mp.to_string_lossy().into_owned());
+        #[cfg(feature = "fuse")]
+        {
+            let fuse_cli = super::fusemount::Cli {
+                options: if cli.options.is_empty() { None } else { Some(cli.options.clone()) },
+                foreground: false,
+                device: cli.dev.clone(),
+                mountpoint: cli.mountpoint.as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            };
+            return match super::fusemount::cmd_fusemount(fuse_cli) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(e) => {
+                    error!("FUSE mount failed: {e}");
+                    std::process::ExitCode::FAILURE
+                }
+            };
         }
-        return match super::fusemount::cmd_fusemount(fuse_argv) {
-            Ok(()) => std::process::ExitCode::SUCCESS,
-            Err(e) => {
-                error!("FUSE mount failed: {e}");
-                std::process::ExitCode::FAILURE
-            }
-        };
+        #[cfg(not(feature = "fuse"))]
+        {
+            error!("FUSE support not compiled in (build with the 'fuse' feature)");
+            return std::process::ExitCode::FAILURE;
+        }
     }
 
     // TODO: centralize this on the top level CLI
@@ -278,10 +500,24 @@ pub fn mount(mut argv: Vec<String>, symlink_cmd: Option<&str>) -> std::process::
         Ok(_)   => std::process::ExitCode::SUCCESS,
         Err(e)   => {
             error!("Mount failed for {}: {e}", cli.dev);
-            if !module_loaded {
+            if !module.loaded {
                 error!("bcachefs module not loaded?");
+                if let Some(e) = module.modprobe_error {
+                    error!("{e}");
+                }
             }
             std::process::ExitCode::FAILURE
         }
     }
 }
+
+pub static CMD: super::CmdDef = {
+    fn __cmd() -> clap::Command { <Cli as clap::CommandFactory>::command() }
+    fn __run(argv: Vec<String>) -> std::process::ExitCode {
+        mount(Cli::parse_from(argv))
+    }
+    super::CmdDef {
+        name: "mount", about: "Mount a filesystem", aliases: &[],
+        kind: super::CmdKind::Typed { cmd: __cmd, run: __run },
+    }
+};

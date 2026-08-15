@@ -1,12 +1,13 @@
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 
 use anyhow::{bail, Result};
-use bch_bindgen::bcachefs;
-use bch_bindgen::c;
-use bch_bindgen::opt_set;
+use bcachefs_kernel::c;
+use bcachefs_kernel::fs::Fs;
+use bcachefs_kernel::opt_set;
 use clap::{Arg, ArgAction, Command};
 
 use crate::commands::opts::{bch_opt_lookup, bch_option_args, bch_options_from_matches};
+use crate::device_scan::OpenedFs;
 use crate::wrappers::handle::BcachefsHandle;
 use crate::wrappers::sysfs;
 
@@ -14,7 +15,7 @@ fn opt_flags() -> u32 {
     c::opt_flags::OPT_FS as u32 | c::opt_flags::OPT_DEVICE as u32
 }
 
-pub fn set_option_cmd() -> Command {
+fn set_option_cmd() -> Command {
     Command::new("set-fs-option")
         .about("Set a filesystem option")
         .long_about("\
@@ -22,7 +23,7 @@ Set a filesystem or device option on a running filesystem. Changes \
 are persisted to the superblock. Use -d to target a specific device \
 for device-scoped options. See <<sec:options>> for the full list of \
 available options.")
-        .args(bch_option_args(opt_flags()))
+        .args(bch_option_args(opt_flags(), false))
         .arg(Arg::new("dev-idx")
             .short('d')
             .long("dev-idx")
@@ -35,7 +36,7 @@ available options.")
             .help("Device path(s)"))
 }
 
-pub fn cmd_set_option(argv: Vec<String>) -> Result<()> {
+fn cmd_set_option(argv: Vec<String>) -> Result<()> {
     let matches = set_option_cmd().get_matches_from(argv);
 
     let devices: Vec<&String> = matches.get_many::<String>("devices").unwrap().collect();
@@ -48,18 +49,23 @@ pub fn cmd_set_option(argv: Vec<String>) -> Result<()> {
         bail!("No options specified");
     }
 
-    let online = devices.iter().any(|dev| sysfs::dev_mounted(dev));
+    let devs: Vec<std::path::PathBuf> = devices.iter().map(|d| d.as_str().into()).collect();
 
-    if online {
-        set_option_online(&devices, &opts)
-    } else {
-        set_option_offline(&devices, &dev_idxs, &opts)
+    let mut fs_opts = c::bch_opts::default();
+    opt_set!(fs_opts, nostart, 1);
+
+    match crate::device_scan::open_online_or_offline(&devs, fs_opts)? {
+        OpenedFs::Online(fs)  => set_option_online(fs, &devices, &dev_idxs, &opts),
+        OpenedFs::Offline(fs) => set_option_offline(fs, &devices, &dev_idxs, &opts),
     }
 }
 
-fn set_option_online(devices: &[&String], opts: &[(String, String)]) -> Result<()> {
-    let fs = BcachefsHandle::open(devices[0].as_str())?;
-
+fn set_option_online(
+    fs: BcachefsHandle,
+    devices: &[&String],
+    dev_idxs: &[u32],
+    opts: &[(String, String)],
+) -> Result<()> {
     for dev in &devices[1..] {
         let fs2 = BcachefsHandle::open(dev.as_str())?;
         if fs.uuid() != fs2.uuid() {
@@ -67,124 +73,193 @@ fn set_option_online(devices: &[&String], opts: &[(String, String)]) -> Result<(
         }
     }
 
+    let mut failed = std::collections::BTreeSet::new();
+
     for (name, value) in opts {
+
         let Some((_id, opt)) = bch_opt_lookup(name) else {
             eprintln!("Unknown option: {name}");
+            failed.insert(name.as_str());
             continue;
         };
         let flags = opt.flags as u32;
 
         if flags & opt_flags() == 0 {
             eprintln!("Can't set option {name}");
+            failed.insert(name.as_str());
             continue;
         }
 
-        if flags & c::opt_flags::OPT_FS as u32 != 0 {
-            sysfs::sysfs_write_str(fs.sysfs_fd(), &format!("options/{name}"), value);
+        // The online path can only write sysfs, and the kernel creates an
+        // option's attribute 0444 unless it is OPT_RUNTIME (fs/opts.c:
+        // `.attr.mode = (_flags) & OPT_RUNTIME ? 0644 : 0444`). So a
+        // non-runtime option has a file that cannot be opened for writing,
+        // and testing OPT_FS|OPT_DEVICE above lets it through to fail.
+        // Many such options *can* be set with the filesystem unmounted, so
+        // say that rather than just refusing.
+        if flags & c::opt_flags::OPT_RUNTIME as u32 == 0 {
+            eprintln!("{name} cannot be set while the filesystem is mounted \
+                       (unmount and set it offline)");
+            failed.insert(name.as_str());
+            continue;
         }
 
-        if flags & c::opt_flags::OPT_DEVICE as u32 != 0 {
+        let is_fs_opt = flags & c::opt_flags::OPT_FS as u32 != 0;
+        let is_device_opt = flags & c::opt_flags::OPT_DEVICE as u32 != 0;
+
+        if is_fs_opt && !is_device_opt {
+            if let Err(e) = sysfs::sysfs_write_str(fs.sysfs_fd(), &format!("options/{name}"), value) {
+                eprintln!("Error setting {name}: {e}");
+                failed.insert(name.as_str());
+            }
+        }
+
+        if is_device_opt {
+            if !dev_idxs.is_empty() {
+                for dev_idx in dev_idxs {
+                    if let Err(e) = sysfs::sysfs_write_str(fs.sysfs_fd(), &format!("dev-{dev_idx}/{name}"), value) {
+                        eprintln!("Error setting {name} on device {dev_idx}: {e}");
+                        failed.insert(name.as_str());
+                    }
+                }
+                continue;
+            }
+
             for dev in devices {
                 let fs2 = BcachefsHandle::open(dev.as_str())?;
                 let dev_idx = fs2.dev_idx();
                 if dev_idx < 0 {
-                    eprintln!("Couldn't determine device index for {dev}");
+                    eprintln!("Couldn't determine device index for {dev}; use --dev-idx");
+                    failed.insert(name.as_str());
                     continue;
                 }
 
-                sysfs::sysfs_write_str(fs.sysfs_fd(), &format!("dev-{dev_idx}/{name}"), value);
+                if let Err(e) = sysfs::sysfs_write_str(fs.sysfs_fd(), &format!("dev-{dev_idx}/{name}"), value) {
+                    eprintln!("Error setting {name} on device {dev_idx}: {e}");
+                    failed.insert(name.as_str());
+                }
             }
         }
+    }
+
+    // A configuration command that could not do what it was asked must not
+    // report success: scripts have no other way to tell.
+    if !failed.is_empty() {
+        bail!("{} of {} option(s) could not be set: {}",
+              failed.len(), opts.len(),
+              failed.into_iter().collect::<Vec<_>>().join(", "));
     }
 
     Ok(())
 }
 
 fn set_option_offline(
+    fs: Fs,
     devices: &[&String],
     dev_idxs: &[u32],
     opts: &[(String, String)],
 ) -> Result<()> {
-    let devs: Vec<std::path::PathBuf> = devices.iter().map(|d| d.as_str().into()).collect();
-
-    let mut fs_opts = bcachefs::bch_opts::default();
-    opt_set!(fs_opts, nostart, 1);
-
-    let fs = crate::device_scan::open_scan(&devs, fs_opts)?;
+    let mut modified = false;
+    let mut failed = std::collections::BTreeSet::new();
 
     for (name, value) in opts {
+
         let Some((opt_id, opt)) = bch_opt_lookup(name) else {
             eprintln!("Unknown option: {name}");
+            failed.insert(name.as_str());
             continue;
         };
         let flags = opt.flags as u32;
 
         if flags & opt_flags() == 0 {
             eprintln!("Can't set option {name}");
+            failed.insert(name.as_str());
             continue;
         }
 
         let c_value = CString::new(value.as_str())?;
-        let mut val: u64 = 0;
-        let ret = unsafe {
-            c::bch2_opt_parse(fs.raw, opt, c_value.as_ptr(), &mut val, std::ptr::null_mut())
-        };
-        if ret < 0 {
+        let Ok(val) = bcachefs_kernel::opts::opt_parse(Some(&fs), opt, &c_value, None) else {
             eprintln!("Error parsing {name}={value}");
+            failed.insert(name.as_str());
             continue;
-        }
+        };
 
         if flags & c::opt_flags::OPT_FS as u32 != 0 {
-            let ret = unsafe {
-                c::bch2_opt_hook_pre_set(fs.raw, std::ptr::null_mut(), 0, opt_id, val, true)
-            };
-            if ret < 0 {
-                eprintln!("Error setting {name}: {ret}");
+            if let Err(e) = fs.opt_hook_pre_set(None, opt_id, val) {
+                eprintln!("Error setting {name}: {e}");
+                failed.insert(name.as_str());
                 continue;
             }
-            unsafe { c::bch2_opt_set_sb(fs.raw, std::ptr::null_mut(), opt, val); }
+            fs.opt_set_sb(None, opt, val, Some(&c_value));
+            modified = true;
         }
 
         if flags & c::opt_flags::OPT_DEVICE as u32 != 0 {
             let indices: Vec<u32> = if !dev_idxs.is_empty() {
                 dev_idxs.to_vec()
             } else {
-                devices.iter().filter_map(|dev| {
-                    name_to_dev_idx(fs.raw, dev).map(|i| i as u32)
-                }).collect()
+                // Don't silently drop a device we couldn't resolve: with every
+                // name unresolved this list is empty, the loop below never
+                // runs, and the command reports success having done nothing.
+                let mut idxs = Vec::with_capacity(devices.len());
+                for dev in devices {
+                    match name_to_dev_idx(&fs, dev) {
+                        Some(i) => idxs.push(i as u32),
+                        None => {
+                            eprintln!("Couldn't find device {dev} in this filesystem");
+                            failed.insert(name.as_str());
+                        }
+                    }
+                }
+                idxs
             };
 
-            for idx in indices {
-                let ca = unsafe { (*fs.raw).devs[idx as usize] };
-                if ca.is_null() {
-                    eprintln!("Couldn't look up device {idx}");
-                    continue;
-                }
+            if indices.is_empty() {
+                eprintln!("No devices to set {name} on");
+                failed.insert(name.as_str());
+            }
 
-                let ret = unsafe {
-                    c::bch2_opt_hook_pre_set(fs.raw, ca, 0, opt_id, val, true)
+            for idx in indices {
+                let Some(ca) = fs.dev_get(idx) else {
+                    eprintln!("Couldn't look up device {idx}");
+                    failed.insert(name.as_str());
+                    continue;
                 };
-                if ret < 0 {
-                    eprintln!("Error setting {name}: {ret}");
+
+                if let Err(e) = fs.opt_hook_pre_set(Some(&ca), opt_id, val) {
+                    eprintln!("Error setting {name}: {e}");
+                    failed.insert(name.as_str());
                     continue;
                 }
-                unsafe { c::bch2_opt_set_sb(fs.raw, ca, opt, val); }
+                fs.opt_set_sb(Some(&ca), opt, val, Some(&c_value));
+                modified = true;
             }
         }
+    }
+
+    if modified {
+        if fs.disk_sb().sb().sb_initialized() == 0 {
+            bail!("superblock not initialized (filesystem was never started): \
+                   bch2_write_super would silently skip the write; mount it once first");
+        }
+        let _lock = fs.sb_lock();
+        fs.write_super_force()
+            .map_err(|e| anyhow::anyhow!("error writing superblock: {e}"))?;
+    }
+
+    if !failed.is_empty() {
+        bail!("{} of {} option(s) could not be set: {}",
+              failed.len(), opts.len(),
+              failed.into_iter().collect::<Vec<_>>().join(", "));
     }
 
     Ok(())
 }
 
-fn name_to_dev_idx(c: *mut c::bch_fs, name: &str) -> Option<usize> {
-    let devs_len = unsafe { (*c).devs.len() };
-    for i in 0..devs_len {
-        let ca = unsafe { (*c).devs[i] };
-        if ca.is_null() { continue; }
-        let ca_name = unsafe { CStr::from_ptr((*ca).name.as_ptr()) };
-        if ca_name.to_bytes() == name.as_bytes() {
-            return Some(i);
-        }
-    }
-    None
+fn name_to_dev_idx(fs: &Fs, name: &str) -> Option<usize> {
+    (0..fs.nr_devices())
+        .find(|&i| fs.dev_get(i).is_some_and(|ca| ca.name().to_bytes() == name.as_bytes()))
+        .map(|i| i as usize)
 }
+
+pub const CMD: super::CmdDef = raw_cmd!("set-fs-option", "Set filesystem options", cmd_set_option);
