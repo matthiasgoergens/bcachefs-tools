@@ -6,23 +6,21 @@ use std::path::Path;
 use std::process;
 
 use anyhow::{anyhow, Result};
-use bch_bindgen::bcachefs;
-use bch_bindgen::c;
-use bch_bindgen::fs::Fs;
-use bch_bindgen::opt_set;
+use bch_bindgen::fs::FsExt;
+use bcachefs_kernel::c;
+use bcachefs_kernel::fs::Fs;
+use bcachefs_kernel::metadata_version;
+use bcachefs_kernel::opt_set;
 use clap::Parser;
 use rustix::event::{poll, PollFd, PollFlags};
 
 use crate::wrappers::handle::BcachefsHandle;
-use bch_bindgen::printbuf::Printbuf;
+use bcachefs_kernel::util::printbuf::Printbuf;
 use crate::device_multipath::{find_multipath_holder, warn_multipath_component};
 use crate::wrappers::sysfs;
 use crate::device_scan;
 
-// _IOW(0xbc, 19, struct bch_ioctl_fsck_offline) — sizeof = 24
-const BCH_IOCTL_FSCK_OFFLINE: libc::c_ulong = 0x4018bc13;
-// _IOW(0xbc, 20, struct bch_ioctl_fsck_online) — sizeof = 16
-const BCH_IOCTL_FSCK_ONLINE: libc::c_ulong = 0x4010bc14;
+use crate::wrappers::ioctl::{ioctl_ptr, ioctl_w, IoctlBuf, BCH_IOCTL_FSCK_OFFLINE, BCH_IOCTL_FSCK_ONLINE};
 
 /// Filesystem check and repair
 #[derive(Parser, Debug)]
@@ -46,7 +44,7 @@ pub struct FsckCli {
 
     /// Additional mount options
     #[arg(short = 'o')]
-    mount_opts: Vec<String>,
+    opts: Vec<String>,
 
     /// Don't display more than 10 errors of a given type
     #[arg(short = 'r', long = "ratelimit_errors")]
@@ -69,14 +67,14 @@ pub struct FsckCli {
     devices: Vec<String>,
 }
 
-fn setnonblocking(fd: BorrowedFd) {
+fn setnonblocking(fd: BorrowedFd<'_>) {
     let flags = rustix::fs::fcntl_getfl(fd).unwrap();
     rustix::fs::fcntl_setfl(fd, flags | rustix::fs::OFlags::NONBLOCK).unwrap();
 }
 
 /// Transfer data from rfd to wfd.  Returns Ok(true) on EOF, Ok(false)
 /// when data was transferred (or EAGAIN), Err on real errors.
-fn do_splice(rfd: BorrowedFd, wfd: BorrowedFd) -> io::Result<bool> {
+fn do_splice(rfd: BorrowedFd<'_>, wfd: BorrowedFd<'_>) -> io::Result<bool> {
     let mut buf = [0u8; 4096];
     let n = match rustix::io::read(rfd, &mut buf) {
         Ok(0) => return Ok(true),
@@ -90,7 +88,7 @@ fn do_splice(rfd: BorrowedFd, wfd: BorrowedFd) -> io::Result<bool> {
         match rustix::io::write(wfd, &buf[off..n]) {
             Ok(w) => off += w,
             Err(rustix::io::Errno::AGAIN) => {
-                poll(&mut [PollFd::new(&wfd, PollFlags::OUT)], -1)?;
+                poll(&mut [PollFd::new(&wfd, PollFlags::OUT)], None)?;
             }
             Err(e) => return Err(e.into()),
         }
@@ -98,7 +96,7 @@ fn do_splice(rfd: BorrowedFd, wfd: BorrowedFd) -> io::Result<bool> {
     Ok(false)
 }
 
-fn splice_fd_to_stdinout(fd: BorrowedFd) -> i32 {
+fn splice_fd_to_stdinout(fd: BorrowedFd<'_>) -> i32 {
     let stdin = io::stdin();
     let stdout = io::stdout();
 
@@ -112,7 +110,7 @@ fn splice_fd_to_stdinout(fd: BorrowedFd) -> i32 {
         if !stdin_closed {
             pollfds.push(PollFd::new(&stdin, PollFlags::IN));
         }
-        let _ = poll(&mut pollfds, -1);
+        let _ = poll(&mut pollfds, None);
 
         match do_splice(fd, stdout.as_fd()) {
             Ok(true) => break,
@@ -140,13 +138,9 @@ fn fsck_online(fs: &BcachefsHandle, opt_str: &str) -> Result<i32> {
         opts: c_opts.as_ptr() as u64,
     };
 
-    let fsck_fd = unsafe {
-        libc::ioctl(fs.ioctl_fd_raw(), BCH_IOCTL_FSCK_ONLINE, &fsck)
-    };
-    if fsck_fd < 0 {
-        let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        return Err(anyhow!("BCH_IOCTL_FSCK_ONLINE error: {}", crate::wrappers::bch_err_str(errno)));
-    }
+    let fsck_fd = ioctl_w::<BCH_IOCTL_FSCK_ONLINE>(fs.ioctl_fd(), &fsck)
+        .map_err(|e| anyhow!("BCH_IOCTL_FSCK_ONLINE error: {}",
+                             crate::wrappers::bch_err_str(e.raw_os_error().unwrap_or(0))))?;
 
     let fd = unsafe { BorrowedFd::borrow_raw(fsck_fd) };
     Ok(splice_fd_to_stdinout(fd))
@@ -158,13 +152,13 @@ fn should_use_kernel_fsck(devs: &[String]) -> bool {
         return false;
     }
 
-    let current = c::bcachefs_metadata_version::bcachefs_metadata_version_max as u64 - 1;
+    let current = u32::from(metadata_version::max) as u64 - 1;
     if kernel_version == current {
         return false;
     }
 
     let dev_paths: Vec<std::path::PathBuf> = devs.iter().map(|d| d.as_str().into()).collect();
-    let mut opts = bcachefs::bch_opts::default();
+    let mut opts = c::bch_opts::default();
     opt_set!(opts, nostart, 1);
     opt_set!(opts, noexcl, 1);
     opt_set!(opts, nochanges, 1);
@@ -223,11 +217,15 @@ fn loopdev_free(path: &str) {
         .status();
 }
 
-pub fn cmd_fsck(argv: Vec<String>) -> Result<()> {
-    let cli = FsckCli::parse_from(argv);
+fn cmd_fsck(cli: FsckCli) -> Result<()> {
 
     if cli.auto_repair {
-        // Automatic run, called by the system — we don't need checks here
+        // -p (preen) is the automatic boot-time invocation (fsck.bcachefs -p,
+        // run by mount/systemd before mounting). bcachefs checks and repairs
+        // at mount time, so there's genuinely nothing to do here — but say so
+        // rather than exiting 0 in silence, which reads as "fsck ran and the
+        // filesystem is clean" when in fact no checking happened.
+        println!("bcachefs: nothing to do for -p (preen): the filesystem is checked and repaired at mount time");
         return Ok(());
     }
 
@@ -239,23 +237,40 @@ pub fn cmd_fsck(argv: Vec<String>) -> Result<()> {
         None
     };
 
-    let mut opts_str = String::from("degraded,fsck,fix_errors=ask,read_only");
+    // If the user explicitly set recovery_passes, skip the "fsck" option:
+    // with fsck=1 the kernel ORs in the full PASS_FSCK default set on top
+    // of the user's request, so -o recovery_passes=check_dirents would
+    // still run check_allocations, check_alloc_info, etc. Dropping fsck
+    // lets the user's pass selection be the actual set that runs.
+    let user_set_recovery_passes = cli.opts.iter().any(|o| {
+        o.split(',').any(|tok| {
+            tok == "recovery_passes" || tok.starts_with("recovery_passes=")
+        })
+    });
+
+    let mut opts: Vec<String> = vec![
+        "degraded".into(),
+        "fix_errors=ask".into(),
+        "read_only".into(),
+        "noreconcile_enabled".into(),
+    ];
+    if !user_set_recovery_passes {
+        opts.insert(1, "fsck".into());
+    }
 
     if cli.yes {
-        opts_str.push_str(",fix_errors=yes");
+        opts.push("fix_errors=yes".into());
     }
     if cli.no_repair {
-        opts_str.push_str(",nochanges,fix_errors=no");
+        opts.push("nochanges".into());
+        opts.push("fix_errors=no".into());
     }
-    for o in &cli.mount_opts {
-        opts_str.push(',');
-        opts_str.push_str(o);
-    }
+    opts.extend(cli.opts.iter().cloned());
     if cli.ratelimit_errors {
-        opts_str.push_str(",ratelimit_errors");
+        opts.push("ratelimit_errors".into());
     }
     if cli.verbose {
-        opts_str.push_str(",verbose");
+        opts.push("verbose".into());
     }
 
     let devices = &cli.devices;
@@ -268,33 +283,23 @@ pub fn cmd_fsck(argv: Vec<String>) -> Result<()> {
         }
     }
 
-    // Check if any device is a mountpoint/directory (online fsck)
-    if devices.len() == 1 {
-        if let Ok(m) = std::fs::metadata(&devices[0]) {
-            if m.is_dir() {
-                println!("Running fsck online");
-                let fs = BcachefsHandle::open(&devices[0])?;
-                let ret = fsck_online(&fs, &opts_str)?;
-                process::exit(ret);
-            }
-        }
-    }
+    let opts_str = opts.join(",");
+    let fs_opts = bcachefs_kernel::opts::parse_mount_opts_vec(&opts, false)
+        .map_err(|e| anyhow!("error parsing options: {}", crate::wrappers::bch_err_str(e.raw())))?;
 
-    // Check if any device is mounted (online fsck)
-    for dev in devices {
-        if sysfs::dev_mounted(dev) {
-            println!("Running fsck online");
-            let fs = BcachefsHandle::open(dev)?;
-            let ret = fsck_online(&fs, &opts_str)?;
-            process::exit(ret);
-        }
+    // If any path resolves to a mounted filesystem - mount point, member
+    // block device, or UUID - fsck online:
+    if let Some(fs) = BcachefsHandle::open_if_mounted_any(devices)? {
+        println!("Running fsck online");
+        let ret = fsck_online(&fs, &opts_str)?;
+        process::exit(ret);
     }
 
     // Discover all devices in a multi-device filesystem. When the user
     // specifies a single device, scan for other members by UUID — same
     // as mount does.
     let devices: Vec<String> = if devices.len() == 1 {
-        let scan_opts = bch_bindgen::opts::parse_mount_opts(None, None, true)
+        let scan_opts = bcachefs_kernel::opts::parse_mount_opts(None, None, true)
             .unwrap_or_default();
         match device_scan::scan_sbs(&devices[0], &scan_opts) {
             Ok(sbs) => sbs.into_iter()
@@ -341,83 +346,52 @@ pub fn cmd_fsck(argv: Vec<String>) -> Result<()> {
                             return Err(anyhow!("error setting up loop devices"));
                         }
                         // Fall through to userspace fsck
-                        return run_userspace_fsck(devices, &opts_str);
+                        return run_userspace_fsck(devices, fs_opts);
                     }
                 }
             }
         }
 
-        // Allocate fsck struct with flexible array
-        let base_size = std::mem::size_of::<c::bch_ioctl_fsck_offline>();
-        let total_size = base_size + dev_ptrs.len() * std::mem::size_of::<u64>();
-        let layout = std::alloc::Layout::from_size_align(total_size, 8).unwrap();
-        let fsck_ptr = unsafe { std::alloc::alloc_zeroed(layout) } as *mut c::bch_ioctl_fsck_offline;
-
+        let mut buf = IoctlBuf::<c::bch_ioctl_fsck_offline>::new::<u64>(dev_ptrs.len());
         let c_opts = CString::new(opts_str.as_str())?;
-        unsafe {
-            (*fsck_ptr).opts = c_opts.as_ptr() as u64;
-            (*fsck_ptr).nr_devs = dev_ptrs.len() as u64;
-            let devs_array = (*fsck_ptr).devs.as_mut_ptr();
-            for (i, ptr) in dev_ptrs.iter().enumerate() {
-                *devs_array.add(i) = *ptr;
-            }
-        }
+        let hdr = buf.hdr_mut();
+        hdr.opts = c_opts.as_ptr() as u64;
+        hdr.nr_devs = dev_ptrs.len() as u64;
+        unsafe { hdr.devs.as_mut_slice(dev_ptrs.len()).copy_from_slice(&dev_ptrs) };
 
         let fsck_fd = match std::fs::OpenOptions::new()
             .read(true).write(true)
             .open("/dev/bcachefs-ctl")
         {
             Ok(ctl_file) => unsafe {
-                libc::ioctl(ctl_file.as_raw_fd(), BCH_IOCTL_FSCK_OFFLINE, fsck_ptr)
+                ioctl_ptr::<BCH_IOCTL_FSCK_OFFLINE>(&ctl_file, buf.as_mut_ptr())
             },
-            Err(_) => -1,
+            Err(e) => Err(e),
         };
-
-        unsafe { std::alloc::dealloc(fsck_ptr as *mut u8, layout); }
 
         for l in &loopdevs { loopdev_free(l); }
 
-        if fsck_fd < 0 && kernel.is_none() {
-            return run_userspace_fsck(devices, &opts_str);
-        }
-
-        if fsck_fd < 0 {
-            let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            return Err(anyhow!("BCH_IOCTL_FSCK_OFFLINE error: {}", crate::wrappers::bch_err_str(errno)));
-        }
+        let fsck_fd = match fsck_fd {
+            Ok(fd) => fd,
+            Err(_) if kernel.is_none() =>
+                return run_userspace_fsck(devices, fs_opts),
+            Err(e) =>
+                return Err(anyhow!("BCH_IOCTL_FSCK_OFFLINE error: {}",
+                                   crate::wrappers::bch_err_str(e.raw_os_error().unwrap_or(0)))),
+        };
 
         let fd = unsafe { BorrowedFd::borrow_raw(fsck_fd) };
         let ret = splice_fd_to_stdinout(fd);
         process::exit(ret);
     }
 
-    run_userspace_fsck(devices, &opts_str)
+    run_userspace_fsck(devices, fs_opts)
 }
 
-fn run_userspace_fsck(devices: &[String], opts_str: &str) -> Result<()> {
+fn run_userspace_fsck(devices: &[String], fs_opts: c::bch_opts) -> Result<()> {
     println!("Running userspace offline fsck");
 
     let dev_paths: Vec<std::path::PathBuf> = devices.iter().map(|d| d.as_str().into()).collect();
-
-    let mut fs_opts = bcachefs::bch_opts::default();
-    let c_opts_str = CString::new(opts_str)?;
-    let c_opts_ptr = c_opts_str.into_raw();
-    let mut parse_later = Printbuf::new();
-    let ret = unsafe {
-        let r = c::bch2_parse_mount_opts(
-            std::ptr::null_mut(),
-            &mut fs_opts,
-            parse_later.as_raw(),
-            c_opts_ptr,
-            false,
-        );
-        // Reclaim the CString to free it
-        let _ = CString::from_raw(c_opts_ptr);
-        r
-    };
-    if ret != 0 {
-        process::exit(ret);
-    }
 
     let fs = device_scan::open_scan(&dev_paths, fs_opts)?;
 
@@ -436,3 +410,5 @@ fn run_userspace_fsck(devices: &[String], opts_str: &str) -> Result<()> {
 
     process::exit(ret)
 }
+
+pub const CMD: super::CmdDef = typed_cmd!("fsck", "Check filesystem consistency", FsckCli, cmd_fsck);

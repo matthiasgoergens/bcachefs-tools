@@ -7,6 +7,35 @@
  * functions or functions whose types don't work well with bindgen.
  */
 
+#include <stddef.h>
+#include <linux/fs.h>
+
+/*
+ * Block device ioctl numbers, for Rust.
+ *
+ * These encode the direction bits and sizeof() of the argument type, both of
+ * which vary by architecture and word size, so they can't be written down -
+ * they have to come from the kernel headers for the target.
+ *
+ * Taking them as bindgen macros meant going through clang_macro_fallback, which
+ * compiles a throwaway probe per macro and never checks whether the probe
+ * compiled: reparse() looks at CXErrorCode, which says whether the reparse ran
+ * rather than whether the code was valid, and nothing reads the diagnostics.
+ * Both ways that can go wrong turned up in the field in the same week - one
+ * build dropped BLKGETSIZE64 and failed at the use site, another kept it with
+ * the size field 1 instead of 8 and shipped a binary that sent the kernel an
+ * ioctl it answered with ENOTTY, partway through a device resize.
+ *
+ * So don't ask bindgen to evaluate these. Evaluate them the way everything else
+ * here gets evaluated - by the C compiler, against the real headers - and hand
+ * Rust a plain integer. Note that nothing below restates what _IO() and _IOR()
+ * mean, which is the other trap: an open-coded 0x127E for BLKROTATIONAL is
+ * correct on exactly the architectures whose _IOC layout you had in mind.
+ */
+static const unsigned long BCH_BLKGETSIZE64	= BLKGETSIZE64;
+static const unsigned long BCH_BLKPBSZGET	= BLKPBSZGET;
+static const unsigned long BCH_BLKROTATIONAL	= BLKROTATIONAL;
+
 struct bch_fs;
 struct bch_sb;
 struct bch_csum;
@@ -43,44 +72,10 @@ struct rust_journal_entries {
 struct rust_journal_entries rust_collect_journal_entries(struct bch_fs *c);
 
 /*
- * Online member iteration shim — wraps the static inline
- * bch2_get_next_online_dev() which handles ref counting internally.
- * rust_put_online_dev_ref() is for cleanup on early loop termination.
- */
-struct bch_dev;
-struct bch_dev *rust_get_next_online_dev(struct bch_fs *c,
-					 struct bch_dev *ca,
-					 unsigned ref_idx);
-void rust_put_online_dev_ref(struct bch_dev *ca, unsigned ref_idx);
-
-/*
- * Dump sanitize shims — wraps crypto operations for encrypted fs dumps.
- */
-struct jset;
-struct bset;
-
-int rust_jset_decrypt(struct bch_fs *c, struct jset *j);
-int rust_bset_decrypt(struct bch_fs *c, struct bset *i, unsigned offset);
-
-/*
- * Open a block device without blkid probe (for migrate, not format).
- * Sets dev->file and dev->bdev from dev->path.
- */
-struct dev_opts;
-int rust_bdev_open(struct dev_opts *dev, unsigned int mode);
-
-/*
  * Bitmap shim — set_bit() is atomic (locked bitops in the kernel),
  * can't be inlined through bindgen.
  */
 void rust_set_bit(unsigned long nr, unsigned long *addr);
-
-/*
- * Device reference shims — wraps static inline bch2_dev_tryget_noerror()
- * and bch2_dev_put() for Rust.
- */
-struct bch_dev *rust_dev_tryget_noerror(struct bch_fs *c, unsigned dev);
-void rust_dev_put(struct bch_dev *ca);
 
 /*
  * Data IO shims — wraps static inlines not available through bindgen.
@@ -95,6 +90,8 @@ void rust_dev_put(struct bch_dev *ca);
  * the flag later to go fully async.
  * Returns 0 on successful submit, or -errno from disk reservation.
  */
+
+struct bch_write_op;
 int rust_write_submit(struct bch_fs *c,
 		      struct bch_write_op *op,
 		      struct bio_vec *bvecs, unsigned nr_bvecs,
@@ -108,6 +105,8 @@ int rust_write_submit(struct bch_fs *c,
  * Submit a read without waiting — Rust handles completion via endio.
  * Caller must heap-allocate rbio and bvecs (they must outlive the IO).
  */
+
+struct bch_read_bio;
 void rust_read_submit(struct bch_fs *c,
 		      struct bch_read_bio *rbio,
 		      struct bio_vec *bvecs, unsigned nr_bvecs,
@@ -134,5 +133,13 @@ int rust_link_data(struct bch_fs *c,
 struct bpos;
 void rust_accounting_mem_read(struct bch_fs *c, struct bpos p,
 			      __u64 *v, unsigned nr);
+
+/*
+ * Unit test for the eytzinger sort/search primitive and the darray 1-based
+ * wrapper (snapshot_id_dying's lookup path). Runs under `cargo test` via a
+ * Rust #[test] wrapper. Returns the number of failed assertions (0 == pass);
+ * failure details are printed to stderr.
+ */
+int rust_eytzinger_test(void);
 
 #endif /* _RUST_SHIMS_H */

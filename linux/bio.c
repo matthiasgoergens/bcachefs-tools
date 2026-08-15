@@ -388,3 +388,18 @@ int bioset_init(struct bio_set *bs,
 		bioset_exit(bs);
 	return ret;
 }
+
+struct bio_set fs_bio_set;
+
+__attribute__((constructor))
+static void fs_bio_set_init(void)
+{
+	if (bioset_init(&fs_bio_set, BIO_POOL_SIZE, 0, BIOSET_NEED_BVECS))
+		BUG();
+}
+
+__attribute__((destructor))
+static void fs_bio_set_exit(void)
+{
+	bioset_exit(&fs_bio_set);
+}

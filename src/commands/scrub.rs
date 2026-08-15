@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::io::FromRawFd;
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,13 +7,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bch_bindgen::c::{
-    bch_data_type, bch_ioctl_data, bch_ioctl_data_event_ret, bch_ioctl_data_progress,
+    bch_ioctl_data, bch_ioctl_data_event_ret, bch_ioctl_data_progress,
+    bch_ioctl_data__bindgen_ty_1__bindgen_ty_1 as ScrubArgs,
 };
+use bch_bindgen::accounting::data_type;
 use clap::Parser;
 
+use crate::commands::DeviceNameArgs;
 use crate::util::{fmt_bytes_human, fmt_sectors_human};
 use crate::wrappers::handle::BcachefsHandle;
-use crate::wrappers::ioctl::bch_ioc_w;
+use crate::wrappers::ioctl::{ioctl_w, BCH_IOCTL_DATA};
 use crate::wrappers::sysfs::{fs_get_devices, sysfs_path_from_fd};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -21,8 +24,6 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 extern "C" fn sigint_handler(_: libc::c_int) {
     INTERRUPTED.store(true, Ordering::Relaxed);
 }
-
-const BCH_IOCTL_DATA_NR: u32 = 10;
 
 /// bch_ioctl_data_event is blocklisted from bindgen (packed+aligned conflict),
 /// so we read raw bytes and extract fields manually.
@@ -44,19 +45,25 @@ fn read_data_event(fd: &mut std::fs::File) -> io::Result<(u8, u8, bch_ioctl_data
     Ok((event_type, event_ret, p))
 }
 
-fn start_scrub(ioctl_fd: i32, dev_idx: u32, data_types: u32) -> Result<std::fs::File> {
+fn start_scrub(ioctl_fd: std::os::fd::BorrowedFd, dev_idx: u32, data_types: u32) -> Result<std::fs::File> {
     let mut cmd = bch_ioctl_data {
         op: bch_bindgen::c::bch_data_ops::BCH_DATA_OP_scrub as u16,
         ..Default::default()
     };
-    cmd.__bindgen_anon_1.scrub.dev = dev_idx;
-    cmd.__bindgen_anon_1.scrub.data_types = data_types;
-
-    let request = bch_ioc_w::<bch_ioctl_data>(BCH_IOCTL_DATA_NR);
-    let ret = unsafe { libc::ioctl(ioctl_fd, request, &mut cmd as *mut bch_ioctl_data) };
-    if ret < 0 {
-        return Err(std::io::Error::last_os_error().into());
+    // bch_ioctl_data's op-params union is emitted as either a native Rust union or
+    // the __BindgenUnionField wrapper, depending on the host libclang's Copy analysis
+    // of its blocklisted __u32 members — non-deterministic across build hosts, and
+    // the wrapper's helper type isn't nameable here. Both forms share one C layout,
+    // so write the scrub params positionally; the asserts pin the layout we rely on.
+    const _: () = assert!(std::mem::offset_of!(ScrubArgs, dev) == 0);
+    const _: () = assert!(std::mem::offset_of!(ScrubArgs, data_types) == 4);
+    unsafe {
+        let p = std::ptr::addr_of_mut!(cmd.__bindgen_anon_1) as *mut u32;
+        p.write(dev_idx);
+        p.add(1).write(data_types);
     }
+
+    let ret = ioctl_w::<BCH_IOCTL_DATA>(ioctl_fd, &cmd)?;
     Ok(unsafe { std::fs::File::from_raw_fd(ret) })
 }
 
@@ -104,17 +111,22 @@ pub struct Cli {
     #[arg(short, long)]
     metadata: bool,
 
+    #[command(flatten)]
+    device_names: DeviceNameArgs,
+
     /// Filesystem path or device
     filesystem: String,
 }
 
-pub fn scrub(argv: Vec<String>) -> Result<()> {
-    let cli = Cli::parse_from(argv);
+fn scrub(cli: Cli) -> Result<()> {
 
-    unsafe { libc::signal(libc::SIGINT, sigint_handler as libc::sighandler_t); }
+    unsafe {
+        libc::signal(libc::SIGINT,
+                     sigint_handler as extern "C" fn(libc::c_int) as libc::sighandler_t);
+    }
 
     let data_types: u32 = if cli.metadata {
-        1 << (bch_data_type::BCH_DATA_btree as u32)
+        1 << u32::from(data_type::btree)
     } else {
         !0u32
     };
@@ -123,9 +135,10 @@ pub fn scrub(argv: Vec<String>) -> Result<()> {
         .with_context(|| format!("opening filesystem '{}'", cli.filesystem))?;
 
     let sysfs_path = sysfs_path_from_fd(handle.sysfs_fd())?;
-    let devices = fs_get_devices(&sysfs_path)?;
+    let name_mode = cli.device_names.name_mode();
+    let devices = fs_get_devices(&sysfs_path, name_mode)?;
 
-    let ioctl_fd = handle.ioctl_fd_raw();
+    let ioctl_fd = handle.ioctl_fd();
     let dev_idx = handle.dev_idx();
 
     let mut scrub_devs: Vec<ScrubDev> = Vec::new();
@@ -161,6 +174,7 @@ pub fn scrub(argv: Vec<String>) -> Result<()> {
     let mut exit_code = 0i32;
     let mut last = Instant::now();
     let mut first = true;
+    let live_output = io::stdout().is_terminal();
 
     loop {
         let now = Instant::now();
@@ -215,31 +229,44 @@ pub fn scrub(argv: Vec<String>) -> Result<()> {
             }
         }
 
-        let stdout = io::stdout();
-        let mut out = stdout.lock();
+        let interrupted = INTERRUPTED.load(Ordering::Relaxed);
+        if live_output || all_done || interrupted {
+            let stdout = io::stdout();
+            let mut out = stdout.lock();
 
-        if !first {
-            for i in 0..scrub_devs.len() {
-                if i > 0 { write!(out, "\x1b[1A")?; }
-                write!(out, "\x1b[2K\r")?;
+            if live_output && !first {
+                for i in 0..scrub_devs.len() {
+                    if i > 0 { write!(out, "\x1b[1A")?; }
+                    write!(out, "\x1b[2K\r")?;
+                }
             }
-        }
 
-        for (i, line) in lines.iter().enumerate() {
-            write!(out, "{}", line)?;
-            if i < lines.len() - 1 { writeln!(out)?; }
+            for (i, line) in lines.iter().enumerate() {
+                write!(out, "{}", line)?;
+                if i < lines.len() - 1 { writeln!(out)?; }
+            }
+            out.flush()?;
         }
-        out.flush()?;
 
         if all_done {
             writeln!(io::stdout())?;
             break;
         }
 
-        if INTERRUPTED.load(Ordering::Relaxed) {
+        if interrupted {
             writeln!(io::stdout())?;
             eprintln!("Interrupted");
             exit_code |= 1;
+
+            // Parallelize kthread_stop() so we don't block on each thread serially
+            let stops: Vec<_> = scrub_devs
+                .iter_mut()
+                .filter_map(|dev| dev.progress_fd.take())
+                .map(|fd| thread::spawn(move || drop(fd)))
+                .collect();
+            for t in stops {
+                let _ = t.join();
+            }
             break;
         }
 
@@ -254,3 +281,10 @@ pub fn scrub(argv: Vec<String>) -> Result<()> {
 
     Ok(())
 }
+
+pub const CMD: super::CmdDef = typed_cmd!(
+    "scrub",
+    "Verify data checksums; affected paths are logged to dmesg",
+    Cli,
+    scrub
+);

@@ -18,12 +18,12 @@
 #include <linux/types.h>
 #include <linux/uuid.h>
 
-#include "bcachefs.h"
-
 #define noreturn __attribute__((noreturn))
 
 void die(const char *, ...)
 	__attribute__ ((format (printf, 1, 2))) noreturn;
+
+void bch2_install_fatal_signal_handlers(void);
 
 char *vmprintf(const char *fmt, va_list args)
 	__attribute__ ((format (printf, 1, 0)));
@@ -69,17 +69,12 @@ do {									\
 char *read_file_str(int, const char *);
 u64 read_file_u64(int, const char *);
 
-u64 get_size(int);
-unsigned get_blocksize(int);
-struct dev_opts;
-int open_for_format(struct dev_opts *, blk_mode_t, bool);
+void blkid_check(int fd, const char *path, bool force);
 
 bool ask_yn(void);
 
 /* Avoid conflicts with libblkid's crc32 function in static builds */
 #define crc32c bch_crc32c
 u32 crc32c(u32, const void *, size_t);
-
-char *fd_to_dev_model(int);
 
 #endif /* _TOOLS_UTIL_H */

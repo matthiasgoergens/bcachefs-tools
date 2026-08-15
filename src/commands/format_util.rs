@@ -2,13 +2,76 @@
 
 //! Rust implementation of bch2_format and bch2_format_for_device_add.
 
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::FileExt;
+use std::os::unix::io::RawFd;
 
 use bch_bindgen::c;
-use bch_bindgen::{opt_defined, opt_get, opt_set};
+use bcachefs_kernel::{metadata_version, opt_defined, opt_get, opt_set};
 
-use crate::wrappers::super_io::{die, BCHFS_MAGIC, SUPERBLOCK_SIZE_DEFAULT};
+use crate::wrappers::super_io::{die, SUPERBLOCK_SIZE_DEFAULT};
+use bcachefs_kernel::sb::io::BCHFS_MAGIC;
+
+/// Device options for formatting — Rust replacement for C struct dev_opts.
+///
+/// Owns the file descriptor and string data.
+pub struct DevOpts {
+    file: Option<OwnedFd>,
+    pub path: CString,
+    /// Deferred device options (labels): their values are resolved against
+    /// the superblock being built, after it exists.
+    pub opt_strs: Vec<(c::bch_opt_id, CString)>,
+    pub sb_offset: u64,
+    pub sb_end: u64,
+    pub nbuckets: u64,
+    pub fs_size: u64,
+    pub opts: c::bch_opts,
+}
+
+impl DevOpts {
+    /// Create a new DevOpts with the given path, no fd yet.
+    pub fn new(path: CString) -> Self {
+        DevOpts {
+            file: None,
+            path,
+            opt_strs: Vec::new(),
+            sb_offset: 0,
+            sb_end: 0,
+            nbuckets: 0,
+            fs_size: 0,
+            opts: Default::default(),
+        }
+    }
+
+    /// The device fd, for interfaces that take raw fds.
+    pub fn fd(&self) -> RawFd {
+        self.file.as_ref().map_or(-1, |f| f.as_raw_fd())
+    }
+
+    /// The device fd; panics if the device hasn't been opened.
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.file.as_ref().expect("device not open").as_fd()
+    }
+
+    /// Open the device for formatting, with blkid checks.
+    ///
+    /// Adds READ|WRITE|EXCL|BUFFERED to the given extra flags
+    /// (matching the old C open_for_format behavior).
+    pub fn open(&mut self, extra_mode: u32, force: bool) -> Result<(), i32> {
+        use crate::wrappers::bdev::*;
+        let mode = BLK_OPEN_READ | BLK_OPEN_WRITE | BLK_OPEN_EXCL | BLK_OPEN_BUFFERED | extra_mode;
+        self.file = Some(open_device(&self.path, mode)?);
+        blkid_check(self.fd(), &self.path, force);
+        Ok(())
+    }
+
+    /// Open the device without blkid checks or default flags (for migrate).
+    pub fn open_no_blkid(&mut self, mode: u32) -> Result<(), i32> {
+        self.file = Some(crate::wrappers::bdev::open_device(&self.path, mode)?);
+        Ok(())
+    }
+}
 
 /// Features enabled on all new filesystems.
 /// Must match BCH_SB_FEATURES_ALL in bcachefs_format.h.
@@ -42,7 +105,7 @@ fn group_to_target(group: u32) -> u32 {
 /// Resolve a target string (device path or disk group name) to a target id.
 fn parse_target(
     sb: &mut c::bch_sb_handle,
-    devs: &[c::dev_opts],
+    devs: &[DevOpts],
     s: *const std::os::raw::c_char,
 ) -> u32 {
     if s.is_null() {
@@ -50,37 +113,35 @@ fn parse_target(
     }
 
     let target_str = unsafe { CStr::from_ptr(s) };
+    let target_str_slice = target_str.to_bytes();
 
     for (idx, dev) in devs.iter().enumerate() {
-        if !dev.path.is_null() {
-            let dev_path = unsafe { CStr::from_ptr(dev.path) };
-            if target_str == dev_path {
-                return dev_to_target(idx);
-            }
+        if target_str_slice == dev.path.as_bytes() {
+            return dev_to_target(idx);
         }
     }
 
-    let idx = unsafe { c::bch2_disk_path_find(sb, s) };
-    if idx >= 0 {
-        return group_to_target(idx as u32);
+    if let Some(idx) = sb.disk_path_find(target_str) {
+        return group_to_target(idx);
     }
 
     die(&format!("Invalid target {}", target_str.to_string_lossy()));
 }
 
 /// Set all sb options from a bch_opts struct.
-fn opt_set_sb_all(sb: *mut c::bch_sb, dev_idx: i32, opts: &mut c::bch_opts) {
-    for (id, opt) in bch_bindgen::opts::opt_table().iter().enumerate() {
-        // SAFETY: id is in 0..bch2_opts_nr, the valid range of bch_opt_id
-        let opt_id: c::bch_opt_id = unsafe { std::mem::transmute(id as u32) };
+fn opt_set_sb_all(sb: &mut c::bch_sb, dev_idx: i32, opts: &mut c::bch_opts) {
+    use bcachefs_kernel::opts;
 
-        let v = if unsafe { c::bch2_opt_defined_by_id(opts, opt_id) } {
-            unsafe { c::bch2_opt_get_by_id(opts, opt_id) }
+    for (id, opt) in opts::opt_table().iter().enumerate() {
+        let opt_id = opts::opt_id(id);
+
+        let v = if opts::opt_defined_by_id(opts, opt_id) {
+            opts::opt_get_by_id(opts, opt_id)
         } else {
-            unsafe { c::bch2_opt_get_by_id(&c::bch2_opts_default, opt_id) }
+            opts::opt_get_by_id(opts::opts_default(), opt_id)
         };
 
-        unsafe { c::__bch2_opt_set_sb(sb, dev_idx, opt, v) };
+        opts::opt_set_sb(sb, dev_idx, opt, v);
     }
 }
 
@@ -89,38 +150,22 @@ fn opt_set_sb_all(sb: *mut c::bch_sb, dev_idx: i32, opts: &mut c::bch_opts) {
 /// Returns a pointer to the superblock (caller must free with `free()`).
 ///
 /// Exits on fatal errors (matching the C `die()` behavior).
-#[no_mangle]
-pub extern "C" fn bch2_format(
+pub fn format(
     fs_opt_strs: c::bch_opt_strs,
     mut fs_opts: c::bch_opts,
     mut opts: c::format_opts,
-    devs: c::dev_opts_list,
+    dev_slice: &mut [DevOpts],
 ) -> *mut c::bch_sb {
-    let dev_slice = unsafe { std::slice::from_raw_parts_mut(devs.data, devs.nr) };
 
     // Get device size if not specified (needed for block size threshold)
     for dev in dev_slice.iter_mut() {
         if dev.fs_size == 0 {
-            dev.fs_size = unsafe { c::get_size((*dev.bdev).bd_fd) };
+            dev.fs_size = crate::wrappers::bdev::get_size(dev.fd());
         }
     }
 
-    // Calculate block size: on large filesystems (>= 1GB), use the maximum
-    // of 4k and the device block size for performance on 4k-sector hardware.
-    // On small filesystems (typically test images on loop devices), default
-    // to 512 bytes to avoid wasting space.
     if opt_defined!(fs_opts, block_size) == 0 {
-        let total_size: u64 = dev_slice.iter().map(|d| d.fs_size).sum();
-
-        let block_size = if total_size >= 1u64 << 30 {
-            let mut bs = 4096u32;
-            for dev in dev_slice.iter() {
-                bs = bs.max(unsafe { c::get_blocksize((*dev.bdev).bd_fd) });
-            }
-            bs
-        } else {
-            512u32
-        };
+        let block_size = pick_block_size(&fs_opts, dev_slice);
         opt_set!(fs_opts, block_size, block_size as u16);
     }
 
@@ -149,7 +194,7 @@ pub extern "C" fn bch2_format(
 
     // Calculate btree node size
     if opt_defined!(fs_opts, btree_node_size) == 0 {
-        let mut s = unsafe { c::bch2_opts_default.btree_node_size };
+        let mut s = bcachefs_kernel::opts::opts_default().btree_node_size;
         for dev in dev_slice.iter() {
             s = s.min(dev.opts.bucket_size);
         }
@@ -172,119 +217,111 @@ pub extern "C" fn bch2_format(
     // ManuallyDrop: we return sb.sb to the caller (who frees it),
     // so we must not let bch_sb_handle's Drop call bch2_free_super.
     let mut sb = std::mem::ManuallyDrop::new(c::bch_sb_handle::default());
-    if unsafe { c::bch2_sb_realloc(&mut *sb, 0) } != 0 {
+    if sb.sb_realloc(0).is_err() {
         die("insufficient memory");
     }
 
-    let sb_ptr = sb.sb;
-    let sb_ref = unsafe { &mut *sb_ptr };
+    sb.sb_mut().version = (opts.version as u16).to_le();
+    sb.sb_mut().version_min = (opts.version as u16).to_le();
+    sb.sb_mut().magic.b = BCHFS_MAGIC;
+    sb.sb_mut().user_uuid = opts.uuid;
+    sb.sb_mut().nr_devices = dev_slice.len() as u8;
 
-    sb_ref.version = (opts.version as u16).to_le();
-    sb_ref.version_min = (opts.version as u16).to_le();
-    sb_ref.magic.b = BCHFS_MAGIC;
-    sb_ref.user_uuid = opts.uuid;
-    sb_ref.nr_devices = devs.nr as u8;
-
-    sb_ref.set_sb_version_incompat_allowed(opts.version as u64);
+    sb.sb_mut().set_sb_version_incompat_allowed(opts.version as u64);
     // These are no longer options, only for compatibility with old versions
-    sb_ref.set_sb_meta_replicas_req(1);
-    sb_ref.set_sb_data_replicas_req(1);
-    sb_ref.set_sb_extent_bp_shift(16);
+    sb.sb_mut().set_sb_meta_replicas_req(1);
+    sb.sb_mut().set_sb_data_replicas_req(1);
+    sb.sb_mut().set_sb_extent_bp_shift(16);
 
     let version_threshold =
-        c::bcachefs_metadata_version::bcachefs_metadata_version_disk_accounting_big_endian as u32;
+        u32::from(metadata_version::disk_accounting_big_endian);
     if opts.version > version_threshold {
-        sb_ref.features[0] |= BCH_SB_FEATURES_ALL.to_le();
+        sb.sb_mut().features[0] |= BCH_SB_FEATURES_ALL.to_le();
     }
 
     // Internal UUID (different from user_uuid)
-    sb_ref.uuid.b = *uuid::Uuid::new_v4().as_bytes();
+    sb.sb_mut().uuid.b = *uuid::Uuid::new_v4().as_bytes();
 
     // Label
     if !opts.label.is_null() {
         let label = unsafe { CStr::from_ptr(opts.label) };
         let label_bytes = label.to_bytes();
-        if label_bytes.len() >= sb_ref.label.len() {
+        if label_bytes.len() >= sb.sb().label.len() {
             die(&format!(
                 "filesystem label too long (max {} characters)",
-                sb_ref.label.len() - 1
+                sb.sb().label.len() - 1
             ));
         }
-        sb_ref.label[..label_bytes.len()].copy_from_slice(label_bytes);
+        sb.sb_mut().label[..label_bytes.len()].copy_from_slice(label_bytes);
     }
 
     // Create ext field before setting options - some options (e.g.
     // dev_readahead) use set_ext which requires this field to exist
-    unsafe {
-        c::bch2_sb_field_get_minsize_id(
-            &mut *sb,
-            c::bch_sb_field_type::BCH_SB_FIELD_ext,
-            (std::mem::size_of::<c::bch_sb_field_ext>() / std::mem::size_of::<u64>()) as u32,
-        );
-    }
+    let ext_u64s = (std::mem::size_of::<c::bch_sb_field_ext>() / std::mem::size_of::<u64>()) as u32;
+    sb.field_get_minsize::<c::bch_sb_field_ext>(ext_u64s);
 
-    opt_set_sb_all(sb_ptr, -1, &mut fs_opts);
+    opt_set_sb_all(sb.sb_mut(), -1, &mut fs_opts);
 
     // Time
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_else(|_| die("error getting current time"));
     let nsec = now.as_secs() * 1_000_000_000 + now.subsec_nanos() as u64;
-    sb_ref.time_base_lo = nsec.to_le();
-    sb_ref.time_precision = 1u32.to_le();
+    sb.sb_mut().time_base_lo = nsec.to_le();
+    sb.sb_mut().time_precision = 1u32.to_le();
 
     // Member info
     let mi_size = std::mem::size_of::<c::bch_sb_field_members_v2>()
-        + std::mem::size_of::<c::bch_member>() * devs.nr;
+        + std::mem::size_of::<c::bch_member>() * dev_slice.len();
     let mi_u64s = mi_size / std::mem::size_of::<u64>();
 
-    let mi = unsafe {
-        c::bch2_sb_field_resize_id(
-            &mut *sb,
-            c::bch_sb_field_type::BCH_SB_FIELD_members_v2,
-            mi_u64s as u32,
-        ) as *mut c::bch_sb_field_members_v2
-    };
-    unsafe {
-        (*mi).member_bytes = (std::mem::size_of::<c::bch_member>() as u16).to_le();
-    }
+    let mi = bcachefs_kernel::sb::io::sb_field_resize::<c::bch_sb_field_members_v2>(&mut sb, mi_u64s as u32)
+        .unwrap_or_else(|| die("failed to resize members_v2 field"));
+    mi.member_bytes = (std::mem::size_of::<c::bch_member>() as u16).to_le();
 
     for (idx, dev) in dev_slice.iter_mut().enumerate() {
-        let m = unsafe { c::bch2_members_v2_get_mut(sb.sb, idx as i32) };
+        let m = sb.member_mut(idx as u32)
+            .unwrap_or_else(|| die("member index out of range"));
+        m.uuid.b = *uuid::Uuid::new_v4().as_bytes();
+        m.nbuckets = dev.nbuckets.to_le();
+        m.first_bucket = 0;
 
-        unsafe {
-            (*m).uuid.b = *uuid::Uuid::new_v4().as_bytes();
-            (*m).nbuckets = dev.nbuckets.to_le();
-            (*m).first_bucket = 0;
-        }
-
+        let fd = dev.fd();
         let opts = &mut dev.opts;
         if opt_defined!(opts, rotational) == 0 {
-            let nonrot = unsafe { c::bdev_nonrot(dev.bdev) };
+            let nonrot = crate::wrappers::bdev::nonrot(fd);
             opt_set!(opts, rotational, !nonrot as u8);
         }
 
-        opt_set_sb_all(sb.sb, idx as i32, &mut dev.opts);
-        unsafe { &mut *m }.set_member_rotational_set(1);
+        opt_set_sb_all(sb.sb_mut(), idx as i32, &mut dev.opts);
+        sb.member_mut(idx as u32).unwrap().set_member_rotational_set(1);
     }
 
-    // Disk labels
+    // Deferred device options: labels resolve to a disk path against the sb we
+    // just built; the failure domain is a plain string stored in the member.
     for (idx, dev) in dev_slice.iter().enumerate() {
-        if dev.label.is_null() {
-            continue;
+        for (opt_id, val) in &dev.opt_strs {
+            match *opt_id {
+                c::bch_opt_id::Opt_label => {
+                    let path_idx = sb.disk_path_find_or_create(val).unwrap_or_else(|e|
+                        die(&format!("error creating disk path: {}",
+                                     std::io::Error::from_raw_os_error(e))));
+                    // Recompute m after sb modification (may have been reallocated)
+                    sb.member_mut(idx as u32).unwrap().set_member_group(path_idx as u64 + 1);
+                }
+                c::bch_opt_id::Opt_failure_domain => {
+                    let bytes = val.to_bytes();
+                    let m = sb.member_mut(idx as u32).unwrap();
+                    if bytes.len() > m.failure_domain.len() {
+                        die(&format!("failure domain name too long (max {} bytes)",
+                                     m.failure_domain.len()));
+                    }
+                    m.failure_domain.fill(0);
+                    m.failure_domain[..bytes.len()].copy_from_slice(bytes);
+                }
+                _ => die(&format!("can't resolve option {:?} at format time", opt_id)),
+            }
         }
-
-        let path_idx = unsafe { c::bch2_disk_path_find_or_create(&mut *sb, dev.label) };
-        if path_idx < 0 {
-            die(&format!(
-                "error creating disk path: {}",
-                std::io::Error::from_raw_os_error(-path_idx)
-            ));
-        }
-
-        // Recompute m after sb modification (memory may have been reallocated)
-        let m = unsafe { c::bch2_members_v2_get_mut(sb.sb, idx as i32) };
-        unsafe { &mut *m }.set_member_group(path_idx as u64 + 1);
     }
 
     // Targets
@@ -294,34 +331,28 @@ pub extern "C" fn bch2_format(
     let background = parse_target(sb_handle, dev_slice, target_strs.background_target);
     let promote    = parse_target(sb_handle, dev_slice, target_strs.promote_target);
     let metadata   = parse_target(sb_handle, dev_slice, target_strs.metadata_target);
-    let sb_ref = unsafe { &mut *sb.sb };
-    sb_ref.set_sb_foreground_target(foreground as u64);
-    sb_ref.set_sb_background_target(background as u64);
-    sb_ref.set_sb_promote_target(promote as u64);
-    sb_ref.set_sb_metadata_target(metadata as u64);
+    sb.sb_mut().set_sb_foreground_target(foreground as u64);
+    sb.sb_mut().set_sb_background_target(background as u64);
+    sb.sb_mut().set_sb_promote_target(promote as u64);
+    sb.sb_mut().set_sb_metadata_target(metadata as u64);
 
     // Encryption
     if opts.encrypted {
-        let crypt_size =
+        let crypt_u64s =
             std::mem::size_of::<c::bch_sb_field_crypt>() / std::mem::size_of::<u64>();
-        let crypt = unsafe {
-            c::bch2_sb_field_resize_id(
-                &mut *sb,
-                c::bch_sb_field_type::BCH_SB_FIELD_crypt,
-                crypt_size as u32,
-            ) as *mut c::bch_sb_field_crypt
-        };
-        unsafe { c::bch_sb_crypt_init(sb.sb, crypt, opts.passphrase) };
-        unsafe { &mut *sb.sb }.set_sb_encryption_type(1);
+        let crypt: &mut c::bch_sb_field_crypt = sb.field_resize(crypt_u64s as u32)
+            .unwrap_or_else(|| die("failed to create crypt field"));
+        let crypt_ptr = crypt as *mut c::bch_sb_field_crypt;
+        unsafe { c::bch_sb_crypt_init(sb.sb, crypt_ptr, opts.passphrase) };
+        sb.sb_mut().set_sb_encryption_type(1);
     }
 
-    unsafe { c::bch2_sb_members_cpy_v2_v1(&mut *sb) };
+    sb.members_cpy_v2_v1();
 
     // Write superblocks to each device
     for (idx, dev) in dev_slice.iter_mut().enumerate() {
         let size_sectors = dev.fs_size >> 9;
-        let sb_ref = unsafe { &mut *sb.sb };
-        sb_ref.dev_idx = idx as u8;
+        sb.sb_mut().dev_idx = idx as u8;
 
         if dev.sb_offset == 0 {
             dev.sb_offset = c::BCH_SB_SECTOR as u64;
@@ -329,7 +360,7 @@ pub extern "C" fn bch2_format(
         }
 
         if let Err(e) = crate::wrappers::super_io::sb_layout_init(
-            unsafe { &mut (*sb.sb).layout },
+            &mut sb.sb_mut().layout,
             fs_opts.block_size as u32,
             dev.opts.bucket_size,
             opts.superblock_size,
@@ -341,7 +372,7 @@ pub extern "C" fn bch2_format(
             return std::ptr::null_mut();
         }
 
-        let fd = unsafe { (*dev.bdev).bd_fd };
+        let fd = dev.fd();
 
         if dev.sb_offset == c::BCH_SB_SECTOR as u64 {
             // Zero start of disk
@@ -351,46 +382,40 @@ pub extern "C" fn bch2_format(
                 .unwrap_or_else(|e| die(&format!("zeroing start of disk: {}", e)));
         }
 
-        crate::wrappers::super_io::bch2_super_write(fd, sb.sb);
-
-        unsafe { libc::close(fd) };
+        crate::wrappers::super_io::bch2_super_write(fd, &mut *sb);
     }
 
-    // udevadm trigger --settle <devices>
-    let mut udevadm = std::process::Command::new("udevadm");
-    udevadm.args(["trigger", "--settle"]);
-    for dev in dev_slice.iter() {
-        if !dev.path.is_null() {
-            let path = unsafe { CStr::from_ptr(dev.path) };
-            udevadm.arg(path.to_str().unwrap_or(""));
-        }
-    }
-    let _ = udevadm.status();
+    let paths: Vec<&str> = dev_slice
+        .iter()
+        .map(|dev| dev.path.to_str().unwrap_or(""))
+        .collect();
+    trigger_udev_for_paths(&paths);
 
     sb.sb
 }
 
+pub fn trigger_udev_for_paths(paths: &[&str]) {
+    let mut udevadm = std::process::Command::new("udevadm");
+    udevadm.args(["trigger", "--settle"]);
+    for path in paths {
+        udevadm.arg(path);
+    }
+    let _ = udevadm.status();
+}
+
 /// Format a single device for addition to an existing filesystem.
-#[no_mangle]
-pub extern "C" fn bch2_format_for_device_add(
-    dev: *mut c::dev_opts,
+pub fn format_for_device_add(
+    dev: &mut DevOpts,
     block_size: u32,
     btree_node_size: u32,
 ) -> i32 {
     let fs_opt_strs: c::bch_opt_strs = Default::default();
-    let mut fs_opts = unsafe { c::bch2_parse_opts(fs_opt_strs) };
+    let mut fs_opts = fs_opt_strs.parse();
     opt_set!(fs_opts, block_size, block_size as u16);
     opt_set!(fs_opts, btree_node_size, btree_node_size);
 
-    let devs = c::dev_opts_list {
-        nr: 1,
-        size: 1,
-        data: dev,
-        preallocated: Default::default(),
-    };
-
     let fmt_opts = format_opts_default();
-    let sb = bch2_format(fs_opt_strs, fs_opts, fmt_opts, devs);
+    let sb = format(fs_opt_strs, fs_opts, fmt_opts, std::slice::from_mut(dev));
     unsafe { libc::free(sb as *mut _) };
 
     0
@@ -407,7 +432,7 @@ pub(crate) fn format_opts_default() -> c::format_opts {
 
     let kernel_version = crate::wrappers::sysfs::bcachefs_kernel_version() as u32;
     let current =
-        c::bcachefs_metadata_version::bcachefs_metadata_version_max as u32 - 1;
+        u32::from(metadata_version::max) - 1;
 
     let version = if kernel_version > 0 {
         current.min(kernel_version)
@@ -450,6 +475,14 @@ fn dev_bucket_size_clamp(fs_opts: c::bch_opts, dev_size: u64, fs_bucket_size: u6
     dev_bucket_size
 }
 
+fn total_system_ram() -> u64 {
+    let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sysinfo(&mut info) } != 0 {
+        die("sysinfo() failed");
+    }
+    info.totalram as u64 * info.mem_unit as u64
+}
+
 fn rounddown_pow_of_two(v: u64) -> u64 {
     if v == 0 {
         return 0;
@@ -457,10 +490,35 @@ fn rounddown_pow_of_two(v: u64) -> u64 {
     1u64 << (63 - v.leading_zeros())
 }
 
+/// Pick the filesystem-wide block size based on device sizes and topology.
+///
+/// On large filesystems (>= 1GB), use the maximum of 4k and the device
+/// physical block size for performance on 4k-sector (or larger) hardware.
+/// On small filesystems (typically test images on loop devices), default
+/// to 512 bytes to avoid wasting space.
+///
+/// Returns the block size in bytes.
+pub fn pick_block_size(_fs_opts: &c::bch_opts, dev_slice: &[DevOpts]) -> u32 {
+    let total_size: u64 = dev_slice.iter().map(|d| d.fs_size).sum();
+
+    let block_size = if total_size >= 1u64 << 30 {
+        let mut bs = 4096u32;
+        for dev in dev_slice.iter() {
+            bs = bs.max(crate::wrappers::bdev::get_blocksize_physical_hint(dev.fd()));
+        }
+        bs
+    } else {
+        512u32
+    };
+
+    block_size
+        .min((u16::MAX as u32 >> 1) + 1)
+}
+
 /// Pick the filesystem-wide bucket size based on device sizes and options.
 ///
 /// Returns the bucket size in bytes.
-pub fn pick_bucket_size(opts: &c::bch_opts, devs: &[c::dev_opts]) -> u64 {
+pub fn pick_bucket_size(opts: &c::bch_opts, devs: &[DevOpts]) -> u64 {
     // Hard minimum: bucket must hold a btree node
     let mut bucket_size = opts.block_size as u64;
     if opt_defined!(opts, btree_node_size) != 0 {
@@ -470,11 +528,7 @@ pub fn pick_bucket_size(opts: &c::bch_opts, devs: &[c::dev_opts]) -> u64 {
     let min_dev_size = c::BCH_MIN_NR_NBUCKETS as u64 * bucket_size;
     for dev in devs {
         if dev.fs_size < min_dev_size {
-            let path = if dev.path.is_null() {
-                "<unknown>".to_string()
-            } else {
-                unsafe { CStr::from_ptr(dev.path) }.to_string_lossy().into_owned()
-            };
+            let path = dev.path.to_string_lossy();
             die(&format!(
                 "cannot format {}, too small ({} bytes, min {})",
                 path, dev.fs_size, min_dev_size
@@ -504,24 +558,22 @@ pub fn pick_bucket_size(opts: &c::bch_opts, devs: &[c::dev_opts]) -> u64 {
     // Upper bound on bucket count: ensure we can fsck with available
     // memory. Large fudge factor to allow for other fsck processes
     // and devices being added after creation
-    let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
-    if unsafe { libc::sysinfo(&mut info) } != 0 {
-        die("sysinfo() failed");
-    }
-    let total_ram = info.totalram as u64 * info.mem_unit as u64;
+    let total_ram = total_system_ram();
     let mem_available_for_fsck = total_ram / 8;
     let bucket_struct_size = std::mem::size_of::<c::bucket>() as u64;
     let buckets_can_fsck = mem_available_for_fsck / (bucket_struct_size * 3 / 2);
     let mem_lower_bound = (total_fs_size / buckets_can_fsck).next_power_of_two();
     bucket_size = bucket_size.max(mem_lower_bound);
 
-    bucket_size.next_power_of_two()
+    bucket_size
+        .next_power_of_two()
+        .min((u32::MAX as u64 >> 1) + 1)
 }
 
 /// Validate that a device's bucket size is consistent with filesystem options.
 ///
 /// Exits on validation failure (matches C `die()` behavior).
-pub fn check_bucket_size(opts: &c::bch_opts, dev: &c::dev_opts) {
+pub fn check_bucket_size(opts: &c::bch_opts, dev: &DevOpts) {
     if dev.opts.bucket_size < opts.block_size as u32 {
         die(&format!(
             "Bucket size ({}) cannot be smaller than block size ({})",
@@ -547,17 +599,3 @@ pub fn check_bucket_size(opts: &c::bch_opts, dev: &c::dev_opts) {
         ));
     }
 }
-
-/// C-compatible wrapper.
-#[no_mangle]
-pub extern "C" fn bch2_pick_bucket_size(opts: c::bch_opts, devs: c::dev_opts_list) -> u64 {
-    let dev_slice = unsafe { std::slice::from_raw_parts(devs.data, devs.nr) };
-    pick_bucket_size(&opts, dev_slice)
-}
-
-/// C-compatible wrapper.
-#[no_mangle]
-pub extern "C" fn bch2_check_bucket_size(opts: c::bch_opts, dev: *mut c::dev_opts) {
-    check_bucket_size(&opts, unsafe { &*dev });
-}
-

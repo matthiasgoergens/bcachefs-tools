@@ -1,14 +1,13 @@
 use std::fmt::Write;
 
-use anyhow::{bail, Result};
-use bch_bindgen::bcachefs;
-use bch_bindgen::c;
-use bch_bindgen::opt_set;
+use anyhow::Result;
+use bcachefs_kernel::c;
+use bcachefs_kernel::opt_set;
 use clap::Parser;
 
 use crate::util::read_flag_list;
 
-use bch_bindgen::printbuf::Printbuf;
+use bcachefs_kernel::util::printbuf::Printbuf;
 
 /// List and manage scheduled recovery passes
 #[derive(Parser, Debug)]
@@ -27,8 +26,7 @@ pub struct RecoveryPassCli {
     devices: Vec<String>,
 }
 
-pub fn cmd_recovery_pass(argv: Vec<String>) -> Result<()> {
-    let cli = RecoveryPassCli::parse_from(argv);
+fn cmd_recovery_pass(cli: RecoveryPassCli) -> Result<()> {
 
     let mut passes_to_set: u64 = 0;
     let mut passes_to_unset: u64 = 0;
@@ -46,7 +44,7 @@ pub fn cmd_recovery_pass(argv: Vec<String>) -> Result<()> {
 
     let devs: Vec<std::path::PathBuf> = cli.devices.iter().map(|d| d.as_str().into()).collect();
 
-    let mut fs_opts = bcachefs::bch_opts::default();
+    let mut fs_opts = c::bch_opts::default();
     opt_set!(fs_opts, nostart, 1);
 
     let fs = crate::device_scan::open_scan(&devs, fs_opts)?;
@@ -54,22 +52,18 @@ pub fn cmd_recovery_pass(argv: Vec<String>) -> Result<()> {
     unsafe {
         let _sb_lock = crate::wrappers::sb_lock(fs.raw);
 
-        let ext = c::bch2_sb_field_get_minsize_id(
+        let ext_u64s = (std::mem::size_of::<c::bch_sb_field_ext>() / std::mem::size_of::<u64>()) as u32;
+        let ext: &mut c::bch_sb_field_ext = bcachefs_kernel::sb::io::sb_field_get_minsize(
             &mut (*fs.raw).disk_sb,
-            c::bch_sb_field_type::BCH_SB_FIELD_ext,
-            (std::mem::size_of::<c::bch_sb_field_ext>() / std::mem::size_of::<u64>()) as u32,
-        ) as *mut c::bch_sb_field_ext;
+            ext_u64s,
+        ).ok_or_else(|| anyhow::anyhow!("Error getting sb_field_ext"))?;
 
-        if ext.is_null() {
-            bail!("Error getting sb_field_ext");
-        }
-
-        let mut scheduled = u64::from_le((*ext).recovery_passes_required[0]);
+        let mut scheduled = u64::from_le(ext.recovery_passes_required[0]);
 
         if passes_to_set != 0 || passes_to_unset != 0 {
-            (*ext).recovery_passes_required[0] &= !passes_to_unset.to_le();
-            (*ext).recovery_passes_required[0] |= passes_to_set.to_le();
-            scheduled = u64::from_le((*ext).recovery_passes_required[0]);
+            ext.recovery_passes_required[0] &= !passes_to_unset.to_le();
+            ext.recovery_passes_required[0] |= passes_to_set.to_le();
+            scheduled = u64::from_le(ext.recovery_passes_required[0]);
             fs.write_super();
         }
 
@@ -92,3 +86,5 @@ pub fn cmd_recovery_pass(argv: Vec<String>) -> Result<()> {
 
     Ok(())
 }
+
+pub const CMD: super::CmdDef = typed_cmd!("recovery-pass", "Manage recovery passes", RecoveryPassCli, cmd_recovery_pass);

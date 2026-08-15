@@ -7,7 +7,14 @@
 #include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
+#include <linux/percpu.h>
 #include <linux/shrinker.h>
+
+#include <linux/futex.h>
+/* hack for mips: */
+#define CONFIG_RCU_HAVE_FUTEX 1
+#include <urcu/futex.h>
+#include <urcu.h>
 
 #include "tools-util.h"
 
@@ -126,6 +133,7 @@ void linux_shrinkers_init(void)
 {
 	rcu_init();
 	rcu_register_thread();
+	bch_percpu_thread_init();
 
 	blkdev_init();
 

@@ -1,8 +1,10 @@
 #!/bin/bash
 # Publish built .deb packages to apt.bcachefs.org
 #
-# Signs .debs with debsigs, then includes them in aptly repos and publishes.
-# Called by the orchestrator after all builds for a commit succeed.
+# Signs .debs with debsigs, then includes them in aptly repos and publishes
+# to a staging directory. After aptly finishes, rsync with --delay-updates
+# copies to the live directory — each file is written to a temp name, then
+# renamed into place, so the live tree is never in an inconsistent state.
 #
 # Usage: publish.sh COMMIT [snapshot|release]
 #   SUITE defaults to "snapshot" (use "release" for tagged releases)
@@ -28,9 +30,15 @@ source "$STATE_DIR/config"
 : "${APTLY_ROOT:?not set in config}"
 : "${PUBLISH_ROOT:=$APTLY_ROOT/public}"
 
+STAGING_ROOT="$APTLY_ROOT/staging"
 SNAPSHOT_DATE="$(date -u +%Y%m%d%H%M%S)"
 
-# Minimal aptly config — points at the existing db/pool/public
+mkdir -p "$STAGING_ROOT"
+
+# Aptly config — publish to staging directory, not directly to live.
+# No -force-overwrite: that flag corrupts shared pool files by overwriting
+# them in-place, leaving metadata hashes stale.  Instead we remove old
+# packages before adding new ones.
 APTLY_CONF="$(mktemp)"
 trap "rm -f '$APTLY_CONF'" EXIT
 cat > "$APTLY_CONF" << EOF
@@ -40,7 +48,7 @@ cat > "$APTLY_CONF" << EOF
     "skipContentsPublishing": true,
     "FileSystemPublishEndpoints": {
         "public": {
-            "rootDir": "$PUBLISH_ROOT",
+            "rootDir": "$STAGING_ROOT",
             "linkMethod": "symlink"
         }
     }
@@ -55,6 +63,46 @@ SRC_DIR="$BUILD_DIR/source/result"
 if [ ! -d "$SRC_DIR" ]; then
     echo "ERROR: no source result dir at $SRC_DIR"
     exit 1
+fi
+
+# Last line of defence before users: a snapshot version must never enter the
+# release suite.
+#
+# build-source.sh only emits '~' on its snapshot branch - a tagged build uses
+# the tag verbatim - so '~' in a release publish means the source package was
+# built before this commit was known to be a release, and the version is wrong
+# no matter how correct the artifacts are. Worse, '~' sorts *below* nothing in
+# Debian, so 1.39.0~2026... is lower than 1.39.0: the release publishes, looks
+# successful, and is never offered to anyone already on the previous version.
+#
+# That is exactly what happened on 2026-08-09. The tag ref landed 9 seconds
+# after the version was stamped; the build was correct as a snapshot and got
+# reclassified 42 minutes later at publish time. Nobody found out for a day.
+#
+# Refuse loudly instead. The fix is to rebuild the source package now that the
+# tag exists - the binaries are all derived from it, so there is nothing here
+# worth salvaging.
+if [ "$SUITE" = "release" ]; then
+    SRC_VERSION=$(find "$SRC_DIR" -maxdepth 1 -name '*.dsc' -print -quit)
+    SRC_VERSION=$(sed -n 's/^Version: //p' "$SRC_VERSION" 2>/dev/null)
+    case "$SRC_VERSION" in
+        *'~'*)
+            echo "ERROR: refusing to publish a snapshot version to the release suite" >&2
+            echo "  version: $SRC_VERSION" >&2
+            echo "  commit:  $COMMIT" >&2
+            echo "" >&2
+            echo "  '~' sorts below nothing in Debian, so this would publish" >&2
+            echo "  successfully and never be offered as an upgrade." >&2
+            echo "  The source package predates the tag: rebuild it." >&2
+            exit 1
+            ;;
+        "")
+            echo "ERROR: could not read a version from any .dsc in $SRC_DIR" >&2
+            echo "  refusing to publish to the release suite without checking it" >&2
+            exit 1
+            ;;
+    esac
+    echo "--- release version check: $SRC_VERSION ---"
 fi
 
 sign_debs() {
@@ -73,6 +121,7 @@ declare -A DISTRO_DONE
 for job_dir in "$BUILD_DIR"/*/; do
     job="$(basename "$job_dir")"
     [ "$job" = "source" ] && continue
+    [ "$job" = "publish" ] && continue
     status="$(cat "$job_dir/status" 2>/dev/null || echo pending)"
     [ "$status" != "done" ] && continue
     distro="${job%-*}"
@@ -96,6 +145,10 @@ for distro in "${!DISTRO_DONE[@]}"; do
             -component=main \
             "$REPO_NAME"
 
+    # Clear old packages before adding — avoids -force-replace/-force-overwrite
+    # which can corrupt pool files shared across repos
+    aptly repo remove "$REPO_NAME" 'Name (% bcachefs-*)' 2>/dev/null || true
+
     # Build list of dirs to include: source + all arches for this distro
     INCLUDE_DIRS=("$SRC_DIR")
     for job_dir in "$BUILD_DIR/${distro}"-*/; do
@@ -105,18 +158,17 @@ for distro in "${!DISTRO_DONE[@]}"; do
     done
 
     # repo add takes .deb/.dsc files directly (avoids needing signed .changes)
-    aptly repo add -force-replace "$REPO_NAME" "${INCLUDE_DIRS[@]}"
+    aptly repo add "$REPO_NAME" "${INCLUDE_DIRS[@]}"
 
     echo "--- $distro: snapshot $SNAPSHOT_NAME ---"
     aptly snapshot create "$SNAPSHOT_NAME" from repo "$REPO_NAME"
 
     echo "--- $distro: publish ---"
     if aptly publish show "$REPO_SUITE" "$PUBLISH_PREFIX" &>/dev/null; then
-        aptly publish switch -force-overwrite \
+        aptly publish switch \
             "$REPO_SUITE" "$PUBLISH_PREFIX" "$SNAPSHOT_NAME"
     else
         aptly publish snapshot \
-            -force-overwrite \
             -acquire-by-hash \
             -origin="apt.bcachefs.org" \
             -label="apt.bcachefs.org Packages" \
@@ -124,5 +176,64 @@ for distro in "${!DISTRO_DONE[@]}"; do
             "$PUBLISH_PREFIX"
     fi
 done
+
+# Sync staging to live directory.  --delay-updates writes each updated file
+# to a temp name first, then renames them all into place at the end — the
+# live tree is never half-old half-new.
+# No --delete: staging only has suites published in this run, other suites
+# (e.g. snapshot when publishing release, or vice versa) must be preserved.
+echo "--- Syncing staging to live ---"
+rsync -rlpt --delay-updates "$STAGING_ROOT/" "$PUBLISH_ROOT/"
+
+# Export GPG public key so users can fetch it for apt verification
+echo "--- Exporting GPG public key ---"
+gpg --export "$GPG_SIGNING_SUBKEY_FINGERPRINT" > "$PUBLISH_ROOT/apt.bcachefs.org.pgp"
+gpg --armor --export "$GPG_SIGNING_SUBKEY_FINGERPRINT" > "$PUBLISH_ROOT/apt.bcachefs.org.asc"
+
+# Generate landing page footer (nginx fancyindex_footer)
+echo "--- Generating landing page ---"
+mkdir -p "$PUBLISH_ROOT/.footer"
+cat > "$PUBLISH_ROOT/.footer/README.html" << 'FOOTER'
+<hr>
+<h2>Adding this repository</h2>
+<pre><code>sudo install -d -m 0755 /etc/apt/keyrings
+wget -qO- https://apt.bcachefs.org/apt.bcachefs.org.asc | sudo tee /etc/apt/keyrings/apt.bcachefs.org.asc &gt; /dev/null
+sudo chmod 0644 /etc/apt/keyrings/apt.bcachefs.org.asc
+FOOTER
+
+# Inject the real fingerprint
+cat >> "$PUBLISH_ROOT/.footer/README.html" << EOF
+# Fingerprint: $GPG_SIGNING_SUBKEY_FINGERPRINT
+EOF
+
+cat >> "$PUBLISH_ROOT/.footer/README.html" << 'FOOTER'
+
+sudo tee /etc/apt/sources.list.d/apt.bcachefs.org.sources > /dev/null &lt;&lt;SOURCES
+Types: deb deb-src
+URIs: https://apt.bcachefs.org/$(. /etc/os-release && echo ${VERSION_CODENAME})/
+Suites: bcachefs-tools-release
+Components: main
+Signed-By: /etc/apt/keyrings/apt.bcachefs.org.asc
+SOURCES
+
+sudo apt update
+sudo apt install bcachefs-tools
+</code></pre>
+<p><strong>Important:</strong> packages are built per distribution — the URI must
+name <em>your</em> release codename (the snippet above fills it in from
+<code>/etc/os-release</code>). Repositories exist for the directories listed
+above (e.g. <code>trixie</code>, <code>forky</code>, <code>plucky</code>,
+<code>questing</code>, <code>resolute</code>); <code>unstable</code> is built
+against Debian sid and its dependencies will often not be installable on
+stable releases. If you previously configured this repo with
+<code>unstable</code> in the URI and you're not on sid, edit
+<code>/etc/apt/sources.list.d/apt.bcachefs.org.sources</code> and replace it
+with your codename.</p>
+<p><strong>Note:</strong> For latest <code>git master</code> packages, replace <code>bcachefs-tools-release</code> with <code>bcachefs-tools-snapshot</code>.</p>
+<p>Stable channel: <code>Suites: bcachefs-tools-release</code></p>
+<p>Snapshot/nightly channel: <code>Suites: bcachefs-tools-snapshot</code></p>
+<p>For more information, see the <a href="https://wiki.debian.org/DebianRepository/UseThirdParty">Debian third-party repository guide</a>.</p>
+<p>Binary <code>.deb</code> packages are signed with <a href="https://manpages.debian.org/debsigs">debsigs</a>. Source artifacts can be verified using <a href="https://github.com/sigstore/rekor">Rekor</a>.</p>
+FOOTER
 
 echo "=== Publish complete: $SHORT ==="

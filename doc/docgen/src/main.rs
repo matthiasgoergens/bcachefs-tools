@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
-// X-macro parsing (adapted from bch_bindgen/build.rs)
+// X-macro parsing (adapted from fs/bch_bindgen/build.rs)
 // ---------------------------------------------------------------------------
 
 fn parse_xmacro(source: &str, macro_name: &str) -> Vec<Vec<String>> {
@@ -155,10 +155,39 @@ fn walk_c_files(dir: &Path, f: &mut dyn FnMut(&Path)) {
         let path = entry.path();
         if path.is_dir() {
             walk_c_files(&path, f);
-        } else if matches!(path.extension().and_then(|e| e.to_str()), Some("h" | "c")) {
+        } else if matches!(path.extension().and_then(|e| e.to_str()), Some("h" | "c" | "rs")) {
             f(&path);
         }
     }
+}
+
+/// Parse a Rust string literal starting at the first `"` in @text: returns
+/// the unescaped contents and the byte length consumed through the closing
+/// quote. Handles \n, \t, \", \\, and \<newline> line continuations (which,
+/// like rustc, skip all following whitespace).
+fn parse_rust_string_literal(text: &str) -> Option<(String, usize)> {
+    let start = text.find('"')?;
+    let mut out = String::new();
+    let mut chars = text[start + 1..].char_indices().peekable();
+    while let Some((i, ch)) = chars.next() {
+        match ch {
+            '"' => return Some((out, start + 1 + i + ch.len_utf8())),
+            '\\' => match chars.next()?.1 {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                '\\' => out.push('\\'),
+                '"' => out.push('"'),
+                '\n' => {
+                    while chars.peek().is_some_and(|&(_, c)| c.is_whitespace()) {
+                        chars.next();
+                    }
+                }
+                other => out.push(other),
+            },
+            _ => out.push(ch),
+        }
+    }
+    None
 }
 
 fn extract_doc_blocks_from(path: &Path, source: &str, blocks: &mut Vec<DocBlock>) {
@@ -166,6 +195,26 @@ fn extract_doc_blocks_from(path: &Path, source: &str, blocks: &mut Vec<DocBlock>
     let mut i = 0;
     while i < lines.len() {
         let trimmed = lines[i].trim();
+        // DOC_STRING(key) — the following Rust string literal (typically a
+        // helptext constant, so one text serves --help and the PoO),
+        // converted like a DOC() block.
+        if let Some(rest) = trimmed.strip_prefix("// DOC_STRING(") {
+            if let Some(key) = rest.strip_suffix(')') {
+                let remaining = lines[i + 1..].join("\n");
+                if let Some((content, consumed)) = parse_rust_string_literal(&remaining) {
+                    blocks.push(DocBlock {
+                        raw_latex: false,
+                        key: key.trim().to_string(),
+                        content: content.trim().to_string(),
+                        file: path.to_path_buf(),
+                        line: i + 2,
+                    });
+                    i += remaining[..consumed].matches('\n').count() + 1;
+                }
+            }
+            i += 1;
+            continue;
+        }
         // DOC_LATEX(key) — raw LaTeX, passed through verbatim
         // DOC(key)       — simple markup, converted to LaTeX
         let (rest, raw_latex) = if let Some(rest) = trimmed.strip_prefix("/* DOC_LATEX(") {
@@ -326,8 +375,30 @@ fn markup_to_latex(content: &str) -> String {
     #[derive(PartialEq)]
     enum ListState { None, Itemize, Description }
     let mut list_state = ListState::None;
+    let mut in_verbatim = false;
 
     for line in content.lines() {
+        // Lines indented four or more spaces form a verbatim block -
+        // command tables, examples - emitted raw:
+        if line.starts_with("    ") {
+            if !in_verbatim {
+                match list_state {
+                    ListState::Itemize => out.push_str("\\end{itemize}\n"),
+                    ListState::Description => out.push_str("\\end{description}\n"),
+                    ListState::None => {}
+                }
+                list_state = ListState::None;
+                out.push_str("\\begin{verbatim}\n");
+                in_verbatim = true;
+            }
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if in_verbatim {
+            out.push_str("\\end{verbatim}\n");
+            in_verbatim = false;
+        }
         if line.is_empty() {
             match list_state {
                 ListState::Itemize => {
@@ -383,8 +454,8 @@ fn markup_to_latex(content: &str) -> String {
                 out.push_str(&convert_inline(line));
                 out.push('\n');
             }
-        } else if line.starts_with("  ") && list_state == ListState::Description {
-            // Continuation of previous description item
+        } else if line.starts_with("  ") && list_state != ListState::None {
+            // Continuation of the previous item
             out.push_str(&convert_inline(line.trim_start()));
             out.push('\n');
         } else {
@@ -399,6 +470,9 @@ fn markup_to_latex(content: &str) -> String {
             out.push_str(&convert_inline(line));
             out.push('\n');
         }
+    }
+    if in_verbatim {
+        out.push_str("\\end{verbatim}\n");
     }
     match list_state {
         ListState::Itemize => out.push_str("\\end{itemize}\n"),
@@ -620,7 +694,7 @@ fn parse_opts(entries: &[Vec<String>]) -> Vec<OptEntry> {
 
 fn generate_opts_table(opts: &[OptEntry]) -> String {
     let mut out = String::new();
-    out.push_str("% Auto-generated from BCH_OPTS() in libbcachefs/opts.h — do not edit\n");
+    out.push_str("% Auto-generated from BCH_OPTS() in fs/opts.h — do not edit\n");
     out.push_str("% Regenerate with: cargo run -p bch-docgen\n\n");
 
     out.push_str("\\small\n");
@@ -690,7 +764,7 @@ struct EnumList {
 const ENUM_LISTS: &[EnumList] = &[
     EnumList {
         key: "error-actions",
-        header: "libbcachefs/bcachefs_format.h",
+        header: "fs/bcachefs_format.h",
         macro_name: "BCH_ERROR_ACTIONS",
         default: Some("fix_safe"),
         doc_field: Some(2),
@@ -701,7 +775,7 @@ const ENUM_LISTS: &[EnumList] = &[
     },
     EnumList {
         key: "csum-opts",
-        header: "libbcachefs/bcachefs_format.h",
+        header: "fs/bcachefs_format.h",
         macro_name: "BCH_CSUM_OPTS",
         default: Some("crc32c"),
         doc_field: None,
@@ -712,7 +786,7 @@ const ENUM_LISTS: &[EnumList] = &[
     },
     EnumList {
         key: "compression-opts",
-        header: "libbcachefs/bcachefs_format.h",
+        header: "fs/bcachefs_format.h",
         macro_name: "BCH_COMPRESSION_OPTS",
         default: Some("none"),
         doc_field: None,
@@ -723,7 +797,7 @@ const ENUM_LISTS: &[EnumList] = &[
     },
     EnumList {
         key: "str-hash-opts",
-        header: "libbcachefs/bcachefs_format.h",
+        header: "fs/bcachefs_format.h",
         macro_name: "BCH_STR_HASH_OPTS",
         default: Some("siphash"),
         doc_field: None,
@@ -734,7 +808,7 @@ const ENUM_LISTS: &[EnumList] = &[
     },
     EnumList {
         key: "btree-ids",
-        header: "libbcachefs/bcachefs_format.h",
+        header: "fs/bcachefs_format.h",
         macro_name: "BCH_BTREE_IDS",
         default: None,
         doc_field: Some(4),
@@ -745,7 +819,7 @@ const ENUM_LISTS: &[EnumList] = &[
     },
     EnumList {
         key: "time-stats",
-        header: "libbcachefs/bcachefs.h",
+        header: "fs/bcachefs.h",
         macro_name: "BCH_TIME_STATS",
         default: None,
         doc_field: Some(1),
@@ -756,7 +830,7 @@ const ENUM_LISTS: &[EnumList] = &[
     },
     EnumList {
         key: "sb-fields",
-        header: "libbcachefs/bcachefs_format.h",
+        header: "fs/bcachefs_format.h",
         macro_name: "BCH_SB_FIELDS",
         default: None,
         doc_field: Some(2),
@@ -767,7 +841,7 @@ const ENUM_LISTS: &[EnumList] = &[
     },
     EnumList {
         key: "jset-entry-types",
-        header: "libbcachefs/bcachefs_format.h",
+        header: "fs/bcachefs_format.h",
         macro_name: "BCH_JSET_ENTRY_TYPES",
         default: None,
         doc_field: Some(2),
@@ -778,7 +852,7 @@ const ENUM_LISTS: &[EnumList] = &[
     },
     EnumList {
         key: "counters",
-        header: "libbcachefs/sb/counters_format.h",
+        header: "fs/sb/counters_format.h",
         macro_name: "BCH_PERSISTENT_COUNTERS",
         default: None,
         doc_field: Some(3),
@@ -789,7 +863,7 @@ const ENUM_LISTS: &[EnumList] = &[
     },
     EnumList {
         key: "bkey-types",
-        header: "libbcachefs/bcachefs_format.h",
+        header: "fs/bcachefs_format.h",
         macro_name: "BCH_BKEY_TYPES",
         default: None,
         doc_field: Some(3),
@@ -800,7 +874,7 @@ const ENUM_LISTS: &[EnumList] = &[
     },
     EnumList {
         key: "metadata-versions",
-        header: "libbcachefs/bcachefs_format.h",
+        header: "fs/bcachefs_format.h",
         macro_name: "BCH_METADATA_VERSIONS",
         default: None,
         doc_field: Some(2),
@@ -811,7 +885,7 @@ const ENUM_LISTS: &[EnumList] = &[
     },
     EnumList {
         key: "recovery-passes",
-        header: "libbcachefs/init/passes_format.h",
+        header: "fs/init/passes_format.h",
         macro_name: "BCH_RECOVERY_PASSES",
         default: None,
         doc_field: Some(4),
@@ -966,11 +1040,11 @@ fn find_root() -> PathBuf {
     }
     let mut dir = std::env::current_dir().unwrap();
     loop {
-        if dir.join("libbcachefs").is_dir() {
+        if dir.join("fs").is_dir() {
             return dir;
         }
         if !dir.pop() {
-            eprintln!("error: cannot find bcachefs-tools root (no libbcachefs/ found)");
+            eprintln!("error: cannot find bcachefs-tools root (no fs/ found)");
             std::process::exit(1);
         }
     }
@@ -984,9 +1058,10 @@ fn main() {
     let mut available_keys = HashSet::new();
     let mut errors = 0;
 
-    // --- DOC() blocks from C sources ---
-    let mut doc_blocks = extract_doc_blocks(&root.join("libbcachefs"));
+    // --- DOC() blocks from C and Rust sources ---
+    let mut doc_blocks = extract_doc_blocks(&root.join("fs"));
     doc_blocks.append(&mut extract_doc_blocks(&root.join("c_src")));
+    doc_blocks.append(&mut extract_doc_blocks(&root.join("src")));
 
     for block in &doc_blocks {
         let latex = if block.raw_latex {
@@ -1007,7 +1082,7 @@ fn main() {
     }
 
     // --- BCH_OPTS() table ---
-    let opts_source = fs::read_to_string(root.join("libbcachefs/opts.h")).unwrap();
+    let opts_source = fs::read_to_string(root.join("fs/opts.h")).unwrap();
     let opts_entries = parse_xmacro(&opts_source, "BCH_OPTS");
     let opts = parse_opts(&opts_entries);
     let table = generate_opts_table(&opts);

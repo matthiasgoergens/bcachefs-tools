@@ -15,29 +15,34 @@
 // bch_opt_strs. When a bare path argument is seen, it captures whatever
 // per-device options preceded it.
 
-use std::ffi::{CStr, CString, c_char};
+use std::collections::HashMap;
+use std::ffi::{CString, c_char};
 use std::io;
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::process;
 
 use anyhow::{anyhow, bail, Result};
+use bch_bindgen::fs::FsExt;
 use bch_bindgen::c;
-use bch_bindgen::fs::Fs;
-use bch_bindgen::opt_set;
+use bcachefs_kernel::fs::Fs;
+use bcachefs_kernel::sb::sb_field_type;
+use bcachefs_kernel::{metadata_version, opt_id};
+use bcachefs_kernel::opt_set;
 
+use crate::commands::format_util::DevOpts;
 use crate::commands::opts::{bch_opt_lookup_negated, opts_usage_str, parse_opt_val};
 use crate::device_multipath::{find_multipath_holder, warn_multipath_component};
 use crate::key::Passphrase;
 use crate::util::parse_human_size;
-use bch_bindgen::printbuf::Printbuf;
+use bcachefs_kernel::util::printbuf::Printbuf;
 use crate::wrappers::super_io::SUPERBLOCK_SIZE_DEFAULT;
 use crate::wrappers::sysfs;
 
 const BCH_REPLICAS_MAX: u32 = 4;
 
 pub(crate) fn metadata_version_current() -> u32 {
-    c::bcachefs_metadata_version::bcachefs_metadata_version_max as u32 - 1
+    u32::from(metadata_version::max) - 1
 }
 
 /// Parse a version string "major.minor" or just "minor" (major defaults to 0).
@@ -54,6 +59,11 @@ pub(crate) fn version_parse(s: &str) -> Result<u32> {
         }
     };
     Ok((major << 10) | minor)
+}
+
+/// Render a metadata version as "major.minor" — the inverse of version_parse().
+pub(crate) fn version_to_string(v: u32) -> String {
+    format!("{}.{}", v >> 10, v & ((1 << 10) - 1))
 }
 
 fn format_usage() {
@@ -73,9 +83,10 @@ Usage: bcachefs format [OPTION]... <devices>
 Options:
 {fs_opts}\
       --replicas=#             Sets both data and metadata replicas
+                               With erasure coding, data replicas are capped at 3 (RAID6)
       --encrypted              Enable whole filesystem encryption (chacha20/poly1305)
       --passphrase_file=file   File containing passphrase used for encryption/decryption
-      --no_passphrase          Don't encrypt master encryption key
+      --no_passphrase          Store master encryption key unencrypted in superblock
   -L, --fs_label=label
   -U, --uuid=uuid
       --superblock_size=size
@@ -102,7 +113,8 @@ Report bugs to <linux-bcachefs@vger.kernel.org>
 /// Per-device configuration accumulated during parsing.
 struct DevConfig {
     path: String,
-    label: Option<String>,
+    /// Device options that can only be resolved once the sb exists (labels):
+    opt_strs: Vec<(c::bch_opt_id, String)>,
     fs_size: u64,
     opts: c::bch_opts,
 }
@@ -154,7 +166,68 @@ struct FormatConfig {
     format_version:  Option<u32>,
     superblock_size: u32,
     fs_opts:         c::bch_opts,
-    deferred_opts:   Vec<(usize, String)>,
+    deferred_opts:   Vec<(c::bch_opt_id, String)>,
+}
+
+fn requested_replicas(fs_opts: &c::bch_opts) -> u8 {
+    let defaults = bcachefs_kernel::opts::opts_default();
+    let data = if fs_opts.data_replicas != 0 {
+        fs_opts.data_replicas
+    } else {
+        defaults.data_replicas
+    };
+    let metadata = if fs_opts.metadata_replicas != 0 {
+        fs_opts.metadata_replicas
+    } else {
+        defaults.metadata_replicas
+    };
+
+    data.max(metadata)
+}
+
+fn warn_same_parent_disk_replicas(cfg: &FormatConfig, devices: &[DevOpts]) {
+    if cfg.quiet {
+        return;
+    }
+
+    let replicas = requested_replicas(&cfg.fs_opts);
+    if replicas <= 1 {
+        return;
+    }
+
+    let mut by_parent: HashMap<String, Vec<String>> = HashMap::new();
+    for dev in devices {
+        if let Some(parent) = crate::wrappers::bdev::fd_to_parent_disk_sysfs(dev.fd()) {
+            by_parent
+                .entry(parent.display().to_string())
+                .or_default()
+                .push(dev.path.to_string_lossy().into_owned());
+        }
+    }
+
+    if by_parent.is_empty() || by_parent.len() >= replicas as usize {
+        return;
+    }
+
+    let duplicate_parents: Vec<String> = by_parent.values()
+        .filter(|paths| paths.len() > 1)
+        .map(|paths| paths.join(", "))
+        .collect();
+
+    if duplicate_parents.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "warning: requested {} replicas, but the devices resolve to only {} physical disk{}",
+        replicas,
+        by_parent.len(),
+        if by_parent.len() == 1 { "" } else { "s" },
+    );
+    eprintln!(
+        "warning: multiple format devices share a parent disk: {}",
+        duplicate_parents.join("; "),
+    );
 }
 
 fn parse_format_args(argv: Vec<String>) -> Result<FormatConfig> {
@@ -176,24 +249,35 @@ fn parse_format_args(argv: Vec<String>) -> Result<FormatConfig> {
     let mut superblock_size: u32 = SUPERBLOCK_SIZE_DEFAULT;
 
     // Per-device accumulator
-    let mut cur_label: Option<String> = None;
+    let mut cur_dev_opt_strs: Vec<(c::bch_opt_id, String)> = Vec::new();
     let mut cur_fs_size: u64 = 0;
     let mut cur_dev_opts: c::bch_opts = Default::default();
     let mut unconsumed_dev_option = false;
 
     let mut fs_opts: c::bch_opts = Default::default();
-    let mut deferred_opts: Vec<(usize, String)> = Vec::new();
+    let mut deferred_opts: Vec<(c::bch_opt_id, String)> = Vec::new();
 
     macro_rules! push_device {
         ($path:expr) => {{
+            // Device options are sticky: they apply to all subsequent
+            // devices until overridden by a new value.
             devices.push(DevConfig {
                 path: $path,
-                label: cur_label.take(),
+                opt_strs: cur_dev_opt_strs.clone(),
                 fs_size: cur_fs_size,
-                opts: std::mem::take(&mut cur_dev_opts),
+                opts: cur_dev_opts,
             });
-            cur_fs_size = 0;
             unconsumed_dev_option = false;
+        }};
+    }
+
+    // Sticky like cur_dev_opts: a new value for the same option replaces
+    // the old one.
+    macro_rules! push_dev_opt_str {
+        ($id:expr, $val:expr) => {{
+            cur_dev_opt_strs.retain(|(id, _)| *id != $id);
+            cur_dev_opt_strs.push(($id, $val));
+            unconsumed_dev_option = true;
         }};
     }
 
@@ -233,13 +317,31 @@ fn parse_format_args(argv: Vec<String>) -> Result<FormatConfig> {
                     };
 
                     match parse_opt_val(opt, &val_str)? {
-                        None => deferred_opts.push((opt_id as usize, val_str)),
-                        Some(v) => {
+                        None => {
+                            // Value needs a superblock to resolve against
+                            // (labels, targets); device option values are
+                            // per device, fs option values resolve once:
                             if opt.flags as u32 & c::opt_flags::OPT_DEVICE as u32 != 0 {
-                                unsafe { c::bch2_opt_set_by_id(&mut cur_dev_opts, opt_id, v) };
+                                push_dev_opt_str!(opt_id, val_str);
+                            } else {
+                                deferred_opts.push((opt_id, val_str));
+                            }
+                        }
+                        Some(v) => {
+                            // String-member options (failure_domain) parse to a
+                            // placeholder 0 - the parse is validation only, the
+                            // value is the string itself, applied to the
+                            // bch_member at superblock write time (the
+                            // Opt_failure_domain arm in format_util.rs).
+                            // Routing the placeholder into bch_opts would drop
+                            // the string silently:
+                            if opt.type_ == c::opt_type::BCH_OPT_STR_MEMBER {
+                                push_dev_opt_str!(opt_id, val_str);
+                            } else if opt.flags as u32 & c::opt_flags::OPT_DEVICE as u32 != 0 {
+                                bcachefs_kernel::opts::opt_set_by_id(&mut cur_dev_opts, opt_id, v);
                                 unconsumed_dev_option = true;
                             } else if opt.flags as u32 & c::opt_flags::OPT_FS as u32 != 0 {
-                                unsafe { c::bch2_opt_set_by_id(&mut fs_opts, opt_id, v) };
+                                bcachefs_kernel::opts::opt_set_by_id(&mut fs_opts, opt_id, v);
                             }
                         }
                     }
@@ -284,10 +386,6 @@ fn parse_format_args(argv: Vec<String>) -> Result<FormatConfig> {
                     let size = parse_human_size(&val)?;
                     superblock_size = (size >> 9) as u32;
                 }
-                "label" => {
-                    cur_label = Some(take_opt_value(inline_val, &argv, &mut i, raw_name)?);
-                    unconsumed_dev_option = true;
-                }
                 "version" => {
                     let val = take_opt_value(inline_val, &argv, &mut i, raw_name)?;
                     format_version = Some(version_parse(&val)?);
@@ -317,8 +415,8 @@ fn parse_format_args(argv: Vec<String>) -> Result<FormatConfig> {
                     fs_label = Some(take_short_value(arg, &argv, &mut i, 'L')?);
                 }
                 b'l' => {
-                    cur_label = Some(take_short_value(arg, &argv, &mut i, 'l')?);
-                    unconsumed_dev_option = true;
+                    let val = take_short_value(arg, &argv, &mut i, 'l')?;
+                    push_dev_opt_str!(c::bch_opt_id::Opt_label, val);
                 }
                 b'U' => {
                     let val = take_short_value(arg, &argv, &mut i, 'U')?;
@@ -358,6 +456,14 @@ fn parse_format_args(argv: Vec<String>) -> Result<FormatConfig> {
         bail!("--source, --no_initialize are incompatible");
     }
 
+    if source.is_some() && format_version.is_some() {
+        bail!("--version cannot be used with --source: populating the \
+               filesystem runs the current code's write path, which upgrades \
+               it to the current version as soon as it goes read-write - the \
+               requested version would not survive. Format with --version \
+               alone, then populate using tools of that version.");
+    }
+
     if passphrase_file.is_some() && !encrypted {
         bail!("--passphrase_file requires --encrypted");
     }
@@ -384,15 +490,15 @@ fn parse_format_args(argv: Vec<String>) -> Result<FormatConfig> {
     })
 }
 
-pub fn cmd_format(argv: Vec<String>) -> Result<()> {
+fn cmd_format(argv: Vec<String>) -> Result<()> {
     let mut cfg = parse_format_args(argv)?;
 
     // Handle encryption
     let passphrase: Option<Passphrase> = if cfg.encrypted && !cfg.no_passphrase {
         let p = if let Some(ref path) = cfg.passphrase_file {
-            Passphrase::new_from_file(path)?
+            Passphrase::read_from_file(path)?
         } else {
-            Passphrase::new_from_prompt_twice()?
+            Passphrase::ask_for_new_passphrase()?
         };
         cfg.initialize = false;
         Some(p)
@@ -424,7 +530,16 @@ pub fn cmd_format(argv: Vec<String>) -> Result<()> {
         }
 
         if version != current_version {
-            println!("version mismatch, not initializing");
+            // Not an error: we format at whatever the running kernel supports,
+            // and leave it to create the btree roots at first mount. Say so,
+            // with the numbers - the old message named neither version and
+            // read like a failure, and the filesystem it leaves behind can't
+            // be opened by offline tools until it has been mounted once.
+            println!("formatting at version {} to match the running kernel \
+                      (these tools support {}); the filesystem will be \
+                      initialized when it is first mounted",
+                     version_to_string(version),
+                     version_to_string(current_version));
             cfg.initialize = false;
         }
     }
@@ -456,38 +571,25 @@ pub fn cmd_format(argv: Vec<String>) -> Result<()> {
     let mut fs_opt_strs: c::bch_opt_strs = Default::default();
     for &(id, ref val) in &cfg.deferred_opts {
         let cstr = CString::new(val.as_str())?;
-        let ptr = unsafe { libc::strdup(cstr.as_ptr()) };
-        unsafe { fs_opt_strs.__bindgen_anon_1.by_id[id] = ptr };
+        fs_opt_strs.set(id, &cstr);
     }
 
-    // Build C dev_opts — CStrings must outlive c_devices
-    let dev_cstrs: Vec<(CString, Option<CString>)> = cfg.devices.iter()
-        .map(|dev| Ok((
-            CString::new(dev.path.as_str())?,
-            dev.label.as_ref().map(|l| CString::new(l.as_str())).transpose()?,
-        )))
+    let mut devices: Vec<DevOpts> = cfg.devices.iter()
+        .map(|dev| {
+            let mut d = DevOpts::new(CString::new(dev.path.as_str())?);
+            d.opt_strs = dev.opt_strs.iter()
+                .map(|(id, v)| Ok((*id, CString::new(v.as_str())?)))
+                .collect::<Result<_>>()?;
+            d.fs_size = dev.fs_size;
+            d.opts = dev.opts;
+            Ok(d)
+        })
         .collect::<Result<_>>()?;
 
-    let mut c_devices: Vec<c::dev_opts> = cfg.devices.iter()
-        .zip(&dev_cstrs)
-        .map(|(dev, (path_c, label_c))| {
-            let mut c_dev = c::dev_opts {
-                path: path_c.as_ptr(),
-                fs_size: dev.fs_size,
-                opts: dev.opts,
-                ..Default::default()
-            };
-            if let Some(ref l) = label_c {
-                c_dev.label = l.as_ptr();
-            }
-            c_dev
-        })
-        .collect();
-
     // Open all devices for format
-    for (dev_cfg, c_dev) in cfg.devices.iter().zip(&mut c_devices) {
-        if let Some(mpath_dev) = find_multipath_holder(Path::new(&dev_cfg.path)) {
-            warn_multipath_component(Path::new(&dev_cfg.path), &mpath_dev);
+    for (i, dev) in devices.iter_mut().enumerate() {
+        if let Some(mpath_dev) = find_multipath_holder(Path::new(&cfg.devices[i].path)) {
+            warn_multipath_component(Path::new(&cfg.devices[i].path), &mpath_dev);
             if !cfg.force {
                 // Locking applies to the selected device path only; it is not
                 // coordinated across dm-mpath maps and component devices.
@@ -496,31 +598,60 @@ pub fn cmd_format(argv: Vec<String>) -> Result<()> {
             }
         }
 
-        let ret = unsafe { c::open_for_format(c_dev, 0, cfg.force) };
-        if ret != 0 {
-            let path = unsafe { CStr::from_ptr(c_dev.path) }.to_string_lossy();
-            bail!("Error opening {}: {}", path, io::Error::from_raw_os_error(-ret));
-        }
+        dev.open(0, cfg.force).map_err(|e| {
+            anyhow!("Error opening {}: {}", dev.path.to_string_lossy(), io::Error::from_raw_os_error(e))
+        })?;
     }
 
-    // Call bch2_format
-    let dev_list = c::dev_opts_list {
-        nr: c_devices.len(),
-        size: c_devices.len(),
-        data: c_devices.as_mut_ptr(),
-        preallocated: Default::default(),
-    };
+    warn_same_parent_disk_replicas(&cfg, &devices);
 
-    let sb = crate::commands::format_util::bch2_format(fs_opt_strs, cfg.fs_opts, fmt_opts, dev_list);
+    // Default shard_inode_numbers_bits if the user didn't set it. The policy
+    // (cpu-scaled, fs-size-capped, clamped to [0, 8]) lives in C —
+    // bch2_shard_inode_numbers_bits_default() — so the format-time default and
+    // the kernel sb_validate rewrite of legacy bits=0 filesystems can't diverge.
+    if !bcachefs_kernel::opts::opt_defined_by_id(&cfg.fs_opts, opt_id::shard_inode_numbers_bits) {
+        let nr_cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1) as u32;
+
+        // Total fs size in bytes, populating per-device sizes from fd if the
+        // user didn't specify them.
+        let total_fs_size: u64 = devices.iter_mut().map(|d| {
+            if d.fs_size == 0 {
+                d.fs_size = crate::wrappers::bdev::get_size(d.fd());
+            }
+            d.fs_size
+        }).sum();
+
+        // btree_node_size in bytes; 0 here if the user didn't override (the
+        // default isn't materialized until later), so fall back to the same
+        // 256K default the format path picks.
+        let btree_node_bytes = if cfg.fs_opts.btree_node_size != 0 {
+            cfg.fs_opts.btree_node_size as u64
+        } else {
+            256 << 10
+        };
+
+        let bits = unsafe {
+            c::bch2_shard_inode_numbers_bits_default(nr_cpus, total_fs_size, btree_node_bytes)
+        } as u64;
+        bcachefs_kernel::opts::opt_set_by_id(
+            &mut cfg.fs_opts,
+            opt_id::shard_inode_numbers_bits,
+            bits,
+        );
+    }
+
+    let sb = crate::commands::format_util::format(fs_opt_strs, cfg.fs_opts, fmt_opts, &mut devices);
     if sb.is_null() {
-        bail!("bch2_format returned null");
+        bail!("format returned null");
     }
 
     // Print superblock
     if !cfg.quiet {
         let mut buf = Printbuf::new();
         buf.set_human_readable(true);
-        let fields = 1u32 << c::bch_sb_field_type::BCH_SB_FIELD_members_v2 as u32;
+        let fields = sb_field_type::members_v2.bit();
         unsafe { crate::wrappers::sb_display::sb_to_text_with_names(&mut buf, std::ptr::null_mut(), &*sb, false, fields, -1) };
         print!("{}", buf);
     }
@@ -529,10 +660,12 @@ pub fn cmd_format(argv: Vec<String>) -> Result<()> {
     // Initialize filesystem
     if cfg.initialize {
         let dev_paths: Vec<PathBuf> = cfg.devices.iter().map(|d| PathBuf::from(&d.path)).collect();
+        drop(devices);
+
         let open_opts: c::bch_opts = Default::default();
 
         let fs = Fs::open(&dev_paths, open_opts)
-            .map_err(|e| anyhow!("error opening {}: {}", cfg.devices[0].path, e))?;
+            .map_err(|e| anyhow!("error opening {}: {}", dev_paths[0].display(), e))?;
 
         if let Some(ref src) = cfg.source {
             let file = std::fs::File::open(src)
@@ -547,7 +680,9 @@ pub fn cmd_format(argv: Vec<String>) -> Result<()> {
     }
 
     // Free deferred option strings
-    unsafe { c::bch2_opt_strs_free(&mut fs_opt_strs) };
+    fs_opt_strs.free();
 
     Ok(())
 }
+
+pub const CMD: super::CmdDef = raw_cmd!("format", "Format a new filesystem", aliases: ["mkfs"], cmd_format);

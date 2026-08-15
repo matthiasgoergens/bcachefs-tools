@@ -35,52 +35,59 @@ fn csum_vstruct_sb(sb: *mut c::bch_sb) -> c::bch_csum {
 
 /// Write superblock to all layout locations on disk.
 ///
-/// # Safety
-/// `sb` must point to a valid, fully initialized `bch_sb`.
-///
 /// Exits on I/O errors (matches C `die()` behavior).
-#[no_mangle]
-pub extern "C" fn bch2_super_write(fd: i32, sb: *mut c::bch_sb) {
+pub fn bch2_super_write<S: SbAccess>(fd: i32, sb: &mut S) {
     let file = borrowed_file(fd);
 
-    let bs = unsafe { c::get_blocksize(fd) } as usize;
-    let sb_ref = unsafe { &mut *sb };
+    let bs = crate::wrappers::bdev::get_blocksize_physical_hint(fd) as usize;
+    let layout_range = {
+        let off = std::mem::offset_of!(c::bch_sb, layout);
+        off..off + std::mem::size_of::<c::bch_sb_layout>()
+    };
 
-    let nr_superblocks = sb_ref.layout.nr_superblocks as usize;
+    let nr_superblocks = sb.sb().layout.nr_superblocks as usize;
     for i in 0..nr_superblocks {
-        sb_ref.offset = sb_ref.layout.sb_offset[i];
+        let offset_le = sb.sb().layout.sb_offset[i];
+        let offset_sectors = u64::from_le(offset_le);
 
-        let offset_sectors = u64::from_le(sb_ref.offset);
+        sb.sb_mut().offset = offset_le;
+        sb.sb_mut().csum = csum_vstruct_sb(sb.sb_mut());
 
-        if offset_sectors == c::BCH_SB_SECTOR as u64 {
-            // Write backup layout at byte 4096
-            let buflen = bs.max(4096);
-            let mut buf = vec![0u8; buflen];
+        let sb_src = sb.sb_bytes();
+        let sb_bytes = sb_src.len();
+        let layout_src = &sb_src[layout_range.clone()];
 
-            // Read existing data at 4096 - bs
-            file.read_exact_at(&mut buf[..bs], 4096 - bs as u64)
-                .unwrap_or_else(|e| die(&format!("pread failed at offset {}: {}", 4096 - bs, e)));
+        if offset_sectors == c::BCH_SB_SECTOR as u64 && bs > 4096 {
+            // Layout and superblock are in the same aligned block;
+            // write them together.
+            let layout_offset = (c::BCH_SB_LAYOUT_SECTOR as usize) << 9;
+            let sb_offset = (offset_sectors as usize) << 9;
+            let write_len = round_up(sb_offset + sb_bytes, bs);
+            let mut buf = vec![0u8; write_len];
 
-            // Patch the layout into the end of this block
-            let layout_bytes = std::mem::size_of::<c::bch_sb_layout>();
-            let src = unsafe {
-                std::slice::from_raw_parts(
-                    &sb_ref.layout as *const _ as *const u8,
-                    layout_bytes,
-                )
-            };
-            buf[bs - layout_bytes..bs].copy_from_slice(src);
+            buf[layout_offset..layout_offset + layout_src.len()].copy_from_slice(layout_src);
+            buf[sb_offset..sb_offset + sb_bytes].copy_from_slice(sb_src);
 
-            pwrite_exact(&file, &buf[..bs], 4096 - bs as u64);
+            pwrite_exact(&file, &buf, 0);
+        } else {
+            if offset_sectors == c::BCH_SB_SECTOR as u64 {
+                // Write backup layout in the block preceding the superblock
+                let mut buf = vec![0u8; bs];
+
+                file.read_exact_at(&mut buf, 4096 - bs as u64)
+                    .unwrap_or_else(|e| die(&format!("pread failed at offset {}: {}", 4096 - bs, e)));
+
+                buf[bs - layout_src.len()..].copy_from_slice(layout_src);
+
+                pwrite_exact(&file, &buf, 4096 - bs as u64);
+            }
+
+            let write_len = round_up(sb_bytes, bs);
+            let mut buf = vec![0u8; write_len];
+            buf[..sb_bytes].copy_from_slice(sb_src);
+
+            pwrite_exact(&file, &buf, offset_sectors << 9);
         }
-
-        sb_ref.csum = csum_vstruct_sb(sb);
-
-        let sb_bytes = vstruct_bytes_sb(unsafe { &*sb });
-        let write_len = round_up(sb_bytes, bs);
-        let sb_slice = unsafe { std::slice::from_raw_parts(sb as *const u8, write_len) };
-
-        pwrite_exact(&file, sb_slice, offset_sectors << 9);
     }
 
     if let Err(e) = rustix::fs::fsync(&*file) {
@@ -88,40 +95,27 @@ pub extern "C" fn bch2_super_write(fd: i32, sb: *mut c::bch_sb) {
     }
 }
 
-/// Read a superblock from disk at the given sector offset.
-///
-/// Returns a malloc'd `bch_sb` pointer (caller must free).
-///
-/// Exits if the magic doesn't match or on I/O error.
-#[no_mangle]
-pub extern "C" fn __bch2_super_read(fd: i32, sector: u64) -> *mut c::bch_sb {
+/// Read a superblock from disk at the given sector offset, into an
+/// owned, validated buffer.
+pub fn super_read(fd: i32, sector: u64) -> anyhow::Result<SbBuf> {
     let file = borrowed_file(fd);
 
-    // Read the fixed-size header first
+    // Read the fixed-size header to learn the full extent
     let header_size = std::mem::size_of::<c::bch_sb>();
-    let mut header_buf = vec![0u8; header_size];
-    file.read_exact_at(&mut header_buf, sector << 9)
-        .unwrap_or_else(|e| die(&format!("pread failed at offset {}: {}", sector << 9, e)));
+    let mut buf = vec![0u8; header_size];
+    file.read_exact_at(&mut buf, sector << 9)
+        .map_err(|e| anyhow::anyhow!("pread failed at offset {}: {}", sector << 9, e))?;
 
-    let sb_header = unsafe { &*(header_buf.as_ptr() as *const c::bch_sb) };
+    let u64s_off = std::mem::offset_of!(c::bch_sb, u64s);
+    let u64s = u32::from_le_bytes(buf[u64s_off..u64s_off + 4].try_into().unwrap());
+    let bytes = header_size + u64s as usize * 8;
 
-    if sb_header.magic.b != BCACHE_MAGIC && sb_header.magic.b != BCHFS_MAGIC {
-        die("not a bcachefs superblock");
-    }
+    buf.resize(bytes, 0);
+    file.read_exact_at(&mut buf, sector << 9)
+        .map_err(|e| anyhow::anyhow!("pread failed at offset {}: {}", sector << 9, e))?;
 
-    let bytes = vstruct_bytes_sb(sb_header);
-
-    // Use malloc so the caller can free() it (C callers expect this)
-    let ptr = unsafe { libc::malloc(bytes) as *mut u8 };
-    if ptr.is_null() {
-        die(&format!("allocation failed for superblock ({} bytes)", bytes));
-    }
-
-    let buf = unsafe { std::slice::from_raw_parts_mut(ptr, bytes) };
-    file.read_exact_at(buf, sector << 9)
-        .unwrap_or_else(|e| die(&format!("pread failed at offset {}: {}", sector << 9, e)));
-
-    ptr as *mut c::bch_sb
+    SbBuf::from_bytes(&buf)
+        .map_err(|e| anyhow::anyhow!("superblock at sector {}: {}", sector, e))
 }
 
 fn round_up(val: usize, align: usize) -> usize {
@@ -134,14 +128,7 @@ fn pwrite_exact(file: &std::fs::File, buf: &[u8], offset: u64) {
         .unwrap_or_else(|e| die(&format!("pwrite failed at offset {}: {}", offset, e)));
 }
 
-pub const BCACHE_MAGIC: [u8; 16] = [
-    0xc6, 0x85, 0x73, 0xf6, 0x4e, 0x1a, 0x45, 0xca,
-    0x82, 0x65, 0xf5, 0x7f, 0x48, 0xba, 0x6d, 0x81,
-];
-pub const BCHFS_MAGIC: [u8; 16] = [
-    0xc6, 0x85, 0x73, 0xf6, 0x66, 0xce, 0x90, 0xa9,
-    0xd9, 0x6a, 0x60, 0xcf, 0x80, 0x3d, 0xf7, 0xef,
-];
+use bcachefs_kernel::sb::io::{SbAccess, SbBuf};
 
 /// Default superblock size in 512-byte sectors
 pub const SUPERBLOCK_SIZE_DEFAULT: u32 = 2048;
@@ -159,9 +146,9 @@ pub fn sb_layout_init(
     sb_end: u64,
     no_sb_at_end: bool,
 ) -> anyhow::Result<()> {
-    *l = unsafe { std::mem::zeroed() };
+    *l = Default::default();
 
-    l.magic.b = BCHFS_MAGIC;
+    l.magic.b = bcachefs_kernel::sb::io::BCHFS_MAGIC;
     l.layout_type = 0;
     l.nr_superblocks = 2;
     l.sb_max_size_bits = sb_size.ilog2() as u8;
