@@ -37,6 +37,7 @@ typedef unsigned gfp_t;
 #define GFP_NOIO	0
 #define GFP_NOWAIT	0
 #define __GFP_RECLAIM	0
+#define __GFP_DIRECT_RECLAIM 0
 #define __GFP_FS	0
 #define __GFP_IO	0
 #define __GFP_NOWARN	0
@@ -45,6 +46,7 @@ typedef unsigned gfp_t;
 #define __GFP_ACCOUNT	0
 #define __GFP_RECLAIMABLE 0
 #define __GFP_ZERO	1
+#define __GFP_SKIP_ZERO	0
 #define GFP_KERNEL	2
 
 #define PAGE_ALLOC_COSTLY_ORDER	6

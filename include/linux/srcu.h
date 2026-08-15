@@ -1,6 +1,7 @@
 #ifndef __TOOLS_LINUX_SRCU_H
 #define __TOOLS_LINUX_SRCU_H
 
+#include <linux/cleanup.h>
 #include <linux/rcupdate.h>
 
 #define NUM_ACTIVE_RCU_POLL_OLDSTATE	2
@@ -53,5 +54,10 @@ static inline int init_srcu_struct(struct srcu_struct *ssp)
 {
 	return 0;
 }
+
+DEFINE_LOCK_GUARD_1(srcu, struct srcu_struct,
+		    _T->idx = srcu_read_lock(_T->lock),
+		    srcu_read_unlock(_T->lock, _T->idx),
+		    int idx)
 
 #endif /* __TOOLS_LINUX_SRCU_H */

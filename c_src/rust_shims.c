@@ -6,24 +6,24 @@
 #include <unistd.h>
 
 #include "libbcachefs.h"
-#include "libbcachefs/journal/read.h"
-#include "libbcachefs/journal/seq_blacklist.h"
-#include "libbcachefs/sb/io.h"
-#include "libbcachefs/sb/members.h"
-#include "libbcachefs/alloc/buckets_types.h"
-#include "libbcachefs/data/checksum.h"
-#include "libbcachefs/data/read.h"
-#include "libbcachefs/data/write.h"
-#include "libbcachefs/btree/read.h"
-#include "libbcachefs/init/error.h"
-#include "libbcachefs/init/fs.h"
-#include "libbcachefs/fs/inode.h"
-#include "libbcachefs/journal/journal.h"
-#include "libbcachefs/sb/clean.h"
-#include "libbcachefs/alloc/foreground.h"
-#include "libbcachefs/btree/update.h"
-#include "libbcachefs/data/extents.h"
-#include "libbcachefs/alloc/accounting.h"
+#include "fs/journal/read.h"
+#include "fs/journal/seq_blacklist.h"
+#include "fs/sb/io.h"
+#include "fs/sb/members.h"
+#include "fs/alloc/buckets_types.h"
+#include "fs/data/checksum.h"
+#include "fs/data/read.h"
+#include "fs/data/write.h"
+#include "fs/btree/read.h"
+#include "fs/init/error.h"
+#include "fs/init/fs.h"
+#include "fs/fs/inode.h"
+#include "fs/journal/journal.h"
+#include "fs/sb/clean.h"
+#include "fs/alloc/foreground.h"
+#include "fs/btree/update.h"
+#include "fs/data/extents.h"
+#include "fs/alloc/accounting.h"
 #include "rust_shims.h"
 
 struct bch_csum rust_csum_vstruct_sb(struct bch_sb *sb)
@@ -55,7 +55,7 @@ void strip_fs_alloc(struct bch_fs *c)
 	swap(u64s, clean->field.u64s);
 	bch2_sb_field_resize(&c->disk_sb, clean, u64s);
 
-	scoped_guard(percpu_write, &c->capacity.mark_lock) {
+	scoped_guard(percpu_write_noio, &c->capacity.mark_lock) {
 		kfree(c->replicas.entries);
 		c->replicas.entries = NULL;
 		c->replicas.nr = 0;
@@ -79,24 +79,9 @@ void strip_fs_alloc(struct bch_fs *c)
 
 void rust_strip_alloc_do(struct bch_fs *c)
 {
-	mutex_lock(&c->sb_lock);
+	guard(mutex_noio)(&c->sb_lock);
 	strip_fs_alloc(c);
 	bch2_write_super(c);
-	mutex_unlock(&c->sb_lock);
-}
-
-/* online member iteration shim */
-
-struct bch_dev *rust_get_next_online_dev(struct bch_fs *c,
-					 struct bch_dev *ca,
-					 unsigned ref_idx)
-{
-	return bch2_get_next_online_dev(c, ca, ~0U, READ, ref_idx);
-}
-
-void rust_put_online_dev_ref(struct bch_dev *ca, unsigned ref_idx)
-{
-	enumerated_ref_put(&ca->io_ref[READ], ref_idx);
 }
 
 struct rust_journal_entries rust_collect_journal_entries(struct bch_fs *c)
@@ -124,50 +109,12 @@ struct rust_journal_entries rust_collect_journal_entries(struct bch_fs *c)
 	return ret;
 }
 
-/* dump sanitize shims — wraps crypto operations for encrypted fs dumps */
-
-int rust_jset_decrypt(struct bch_fs *c, struct jset *j)
-{
-	return bch2_encrypt(c, JSET_CSUM_TYPE(j), journal_nonce(j),
-			    j->encrypted_start,
-			    vstruct_end(j) - (void *) j->encrypted_start);
-}
-
-int rust_bset_decrypt(struct bch_fs *c, struct bset *i, unsigned offset)
-{
-	return bset_encrypt(c, i, offset);
-}
-
-
-/* Open a block device without blkid probe (for migrate, not format) */
-
-int rust_bdev_open(struct dev_opts *dev, blk_mode_t mode)
-{
-	dev->file = bdev_file_open_by_path(dev->path, mode, dev, NULL);
-	int ret = PTR_ERR_OR_ZERO(dev->file);
-	if (ret < 0)
-		return ret;
-	dev->bdev = file_bdev(dev->file);
-	return 0;
-}
 
 /* Bitmap shim — set_bit is atomic (locked bitops) */
 
 void rust_set_bit(unsigned long nr, unsigned long *addr)
 {
 	set_bit(nr, addr);
-}
-
-/* Device reference shims */
-
-struct bch_dev *rust_dev_tryget_noerror(struct bch_fs *c, unsigned dev)
-{
-	return bch2_dev_tryget_noerror(c, dev);
-}
-
-void rust_dev_put(struct bch_dev *ca)
-{
-	bch2_dev_put(ca);
 }
 
 /*
@@ -230,7 +177,15 @@ void rust_read_submit(struct bch_fs *c,
 	rbio->bio.bi_iter.bi_sector	= offset >> 9;
 	bio_add_virt_nofail(&rbio->bio, buf, len);
 
-	bch2_read(c, rbio_init(&rbio->bio, c, opts, endio), inum);
+	struct bch_read_bio *r = rbio_init(&rbio->bio, c, opts, endio);
+	BUG_ON(r->_state);
+	r->subvol = inum.subvol;
+
+	CLASS(btree_trans, trans)(c);
+	bch2_read(trans, r, r->bio.bi_iter, inum, NULL, NULL,
+		  BCH_READ_retry_if_stale|
+		  BCH_READ_may_promote|
+		  BCH_READ_user_mapped);
 }
 
 
@@ -280,7 +235,7 @@ int rust_link_data(struct bch_fs *c,
 		bch2_bkey_append_ptr(c, &e->k_i, (struct bch_extent_ptr) {
 					.offset = physical,
 					.dev = 0,
-					.gen = *bucket_gen(ca, b),
+					.generation = *bucket_gen(ca, b),
 				  });
 
 		ret = bch2_disk_reservation_get(c, &res, sectors, 1,
@@ -293,7 +248,8 @@ int rust_link_data(struct bch_fs *c,
 		struct bch_inode_opts opts;
 		ret = commit_do(trans, &res, NULL, 0, ({
 			bch2_bkey_get_io_opts(trans, NULL, bkey_i_to_s_c(&e->k_i), &opts) ?:
-			bch2_bkey_set_needs_reconcile(trans, NULL, &opts, &e->k_i,
+			bch2_bkey_set_needs_reconcile(trans, NULL, &opts, bkey_i_to_s(&e->k_i),
+						      BKEY_EXTENT_U64s_MAX,
 						      SET_NEEDS_RECONCILE_opt_change, 0) ?:
 			bch2_btree_insert(c, BTREE_ID_extents, &e->k_i, &res, 0, 0);
 		}));

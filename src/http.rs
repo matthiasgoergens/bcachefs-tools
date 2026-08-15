@@ -1,48 +1,147 @@
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::CString;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use crate::c;
-use bch_bindgen::printbuf::Printbuf;
+use bcachefs_kernel::util::printbuf::Printbuf;
 
 extern crate tiny_http;
 
-fn http_thread(listen: String) {
-    use tiny_http::{Response, Server};
+fn http_thread(server: tiny_http::Server) {
+    use tiny_http::{Response};
 
-    let server = Server::http(listen).unwrap();
+    // The process-wide SIGPIPE disposition is SIG_DFL for normal CLI pipe
+    // semantics (see main). A client disconnecting mid-response must not
+    // kill the process, so block SIGPIPE in this thread: writes to a dead
+    // socket then fail with EPIPE, which we log and survive.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGPIPE);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
 
     for request in server.incoming_requests() {
         let (_, path) = request.url().split_once('/').unwrap();
 
         let c_path = CString::new(path).unwrap();
 
-        match request.method() {
+        let response = match request.method() {
             tiny_http::Method::Get => {
                 let mut buf = Printbuf::new();
 
                 let ret = unsafe { c::sysfs_read_or_html_dirlist(c_path.as_ptr(), buf.as_raw()) };
 
                 if ret < 0 {
-                    let response = Response::from_string(format!("Error {}", ret))
-                        .with_status_code(403);
-                    request.respond(response).expect("Responded");
+                    Response::from_string(format!("Error {}", ret))
+                        .with_status_code(403)
                 } else {
-                    let response = Response::from_string(buf.as_str());
-                    request.respond(response).expect("Responded");
+                    Response::from_string(buf.as_str())
                 }
             }
 
-            _ => {
-                let response = Response::from_string("Unsupported HTTP method")
-                    .with_status_code(405);
-                request.respond(response).expect("Responded");
-            }
+            _ => Response::from_string("Unsupported HTTP method")
+                    .with_status_code(405),
         };
+
+        if let Err(e) = request.respond(response) {
+            eprintln!("bcachefs http: error sending response: {e}");
+        }
     }
 }
 
-#[no_mangle]
-pub extern "C" fn start_http(listen: *const c_char) {
-    let listen = unsafe { CStr::from_ptr(listen) };
-    let listen = listen.to_string_lossy().into_owned();
+/*
+ * Pick a per-process unix socket path: /run/bcachefs/<pid>.sock for root,
+ * $XDG_RUNTIME_DIR/bcachefs/<pid>.sock (typically /run/user/<uid>/...)
+ * for unprivileged callers. Caller is responsible for ensuring the
+ * parent dir exists (see ensure_socket_dir).
+ */
+fn http_socket_path() -> String {
+    let pid = std::process::id();
+    let uid = unsafe { libc::geteuid() };
+    let parent = if uid == 0 {
+        "/run/bcachefs".to_string()
+    } else if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        format!("{}/bcachefs", dir.to_string_lossy())
+    } else {
+        format!("/run/user/{}/bcachefs", uid)
+    };
+    format!("{}/{}.sock", parent, pid)
+}
 
-    std::thread::spawn(|| http_thread(listen));
+/*
+ * cleanup_socket runs at process exit (atexit handler). It must work
+ * across fork(): the child inherits this registration but binds its
+ * own socket at a child-pid-derived path, so we must compute the path
+ * from the current pid each time rather than caching it.
+ */
+extern "C" fn cleanup_socket() {
+    let path = http_socket_path();
+    let _ = std::fs::remove_file(path);
+}
+
+static STARTED_FOR_PID: AtomicU32 = AtomicU32::new(0);
+static ATEXIT_REGISTERED: AtomicBool = AtomicBool::new(false);
+static INIT_LOCK: Mutex<()> = Mutex::new(());
+
+/*
+ * Bind a unix socket and spawn a thread serving sysfs/debugfs over HTTP.
+ * Idempotent within a process: only the first call per pid actually
+ * starts the server.
+ *
+ * Called from linux/kobject.c's debugfs_create_file shim, so userspace
+ * fses (mount, fsck, format, migrate, ...) all expose their debugfs
+ * tree without needing to opt in.
+ *
+ * Fork handling: process-local Once doesn't work — a child of a process
+ * that already started the server would skip startup and have no http
+ * thread (the parent's thread doesn't survive fork). We track the pid
+ * the server started for, so a forked child that wants a server calls
+ * this again and binds its own at /run/.../<child-pid>.sock.
+ *
+ * That call must be explicit. It used to happen from a pthread_atfork
+ * child handler, which is process-wide: it fired in the child of *any*
+ * fork, including the short-lived one Command::spawn makes to exec
+ * fusermount3. Allocating, binding a socket and creating threads between
+ * fork() and execve() is not allowed, and when pthread_create there
+ * returned EAGAIN the crate-wide panic = "abort" made it fatal, so the
+ * mount failed. It also leaked a socket per exec'ing child, since those
+ * never reach the atexit handler.
+ *
+ * Cleanup is via an atexit handler that unlinks the current pid's
+ * socket on normal exit. Sockets from killed-by-signal / panicked
+ * processes are left behind; user can rm them. Bind fails loudly if a
+ * stale file exists rather than overwriting (so we never hijack an
+ * in-use path).
+ */
+#[no_mangle]
+pub extern "C" fn bch2_start_http_lazy() {
+    let my_pid = std::process::id();
+    if STARTED_FOR_PID.load(Ordering::Acquire) == my_pid {
+        return;
+    }
+
+    let _guard = INIT_LOCK.lock().unwrap();
+    if STARTED_FOR_PID.load(Ordering::Relaxed) == my_pid {
+        return;
+    }
+
+    let path = http_socket_path();
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    match tiny_http::Server::http_unix(std::path::Path::new(&path)) {
+        Ok(server) => {
+            // atexit registrations are inherited across fork; only register
+            // once per process to avoid duplicates.
+            if !ATEXIT_REGISTERED.swap(true, Ordering::AcqRel) {
+                unsafe { libc::atexit(cleanup_socket); }
+            }
+            STARTED_FOR_PID.store(my_pid, Ordering::Release);
+            std::thread::spawn(move || http_thread(server));
+        }
+        Err(e) => {
+            eprintln!("bcachefs: failed to bind {}: {}", path, e);
+        }
+    }
 }

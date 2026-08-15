@@ -10,21 +10,21 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 
 use anyhow::{anyhow, bail, Result};
+use bch_bindgen::fs::FsExt;
 use bch_bindgen::c;
-use bch_bindgen::fs::Fs;
-use bch_bindgen::opt_set;
+use bcachefs_kernel::fs::Fs;
+use bcachefs_kernel::opt_set;
 use clap::Parser;
 
 use crate::commands::format::take_opt_value;
 use crate::commands::opts::{bch_opt_lookup_negated, parse_opt_val};
 use crate::key::Passphrase;
-use crate::commands::format_util::format_opts_default;
+use crate::commands::format_util::{format_opts_default, DevOpts};
 use crate::wrappers::super_io;
 
 // ---- C shim declarations ----
 
 extern "C" {
-    fn rust_bdev_open(dev: *mut c::dev_opts, mode: c::blk_mode_t) -> i32;
     fn rust_set_bit(nr: c_ulong, addr: *mut c_ulong);
 }
 
@@ -302,7 +302,7 @@ Usage: bcachefs migrate [OPTION]...
 Options:
   -f fs                        Root of filesystem to migrate(s)
       --encrypted              Enable whole filesystem encryption (chacha20/poly1305)
-      --no_passphrase          Don't encrypt master encryption key
+      --no_passphrase          Store master encryption key unencrypted in superblock
   -F                           Force, even if metadata file already exists
   -h, --help                   Display this help and exit
 
@@ -341,46 +341,32 @@ fn migrate_fs(
 
     // Find the underlying block device
     let dev_path = dev_t_to_path(fs_dev)?;
-    let dev_path_cstr = CString::new(dev_path.as_str())?;
 
-    // Set up dev_opts and open the device
-    let mut c_dev = c::dev_opts {
-        path: dev_path_cstr.as_ptr(),
-        ..Default::default()
-    };
-
-    let ret = unsafe { rust_bdev_open(&mut c_dev, c::BLK_OPEN_READ | c::BLK_OPEN_WRITE) };
-    if ret < 0 {
-        bail!("Error opening device to format {}: {}", dev_path,
-              io::Error::from_raw_os_error(-ret));
-    }
-
-    let bdev_fd = unsafe { (*c_dev.bdev).bd_fd };
-    let block_size = unsafe { c::get_blocksize(bdev_fd) };
-    opt_set!(fs_opts, block_size, block_size as u16);
+    // Set up DevOpts and open the device
+    let mut c_dev = DevOpts::new(CString::new(dev_path.as_str())?);
+    c_dev.open_no_blkid(
+        crate::wrappers::bdev::BLK_OPEN_READ | crate::wrappers::bdev::BLK_OPEN_WRITE | crate::wrappers::bdev::BLK_OPEN_BUFFERED,
+    ).map_err(|e| {
+        anyhow!("Error opening device to format {}: {}", dev_path, io::Error::from_raw_os_error(e))
+    })?;
 
     let file_path = format!("{}/bcachefs", fs_path);
     println!("Creating new filesystem on {} in space reserved at {}", dev_path, file_path);
 
-    let dev_size = unsafe { c::get_size(bdev_fd) };
+    let dev_size = crate::wrappers::bdev::get_size(c_dev.fd());
     c_dev.fs_size = dev_size;
 
-    // Build a dev_opts_list for bch2_pick_bucket_size
-    let dev_list = c::dev_opts_list {
-        nr: 1,
-        size: 1,
-        data: &mut c_dev,
-        preallocated: Default::default(),
-    };
+    let block_size = crate::commands::format_util::pick_block_size(&fs_opts, std::slice::from_ref(&c_dev));
+    opt_set!(fs_opts, block_size, block_size as u16);
 
-    let bucket_size = unsafe { c::bch2_pick_bucket_size(fs_opts, dev_list) };
+    let bucket_size = crate::commands::format_util::pick_bucket_size(&fs_opts, std::slice::from_ref(&c_dev));
     {
         let dev_opts = &mut c_dev.opts;
         opt_set!(dev_opts, bucket_size, bucket_size as u32);
     }
     c_dev.nbuckets = c_dev.fs_size / c_dev.opts.bucket_size as u64;
 
-    unsafe { c::bch2_check_bucket_size(fs_opts, &mut c_dev) };
+    crate::commands::format_util::check_bucket_size(&fs_opts, &c_dev);
 
     // Reserve space for bcachefs metadata — grab as much as we can
     let (extents, bcachefs_inum) = reserve_new_fs_space(
@@ -400,26 +386,23 @@ fn migrate_fs(
     c_dev.sb_offset = sb_offset;
     c_dev.sb_end = sb_end;
 
-    // Format the filesystem
-    let dev_list = c::dev_opts_list {
-        nr: 1,
-        size: 1,
-        data: &mut c_dev,
-        preallocated: Default::default(),
-    };
+    // format() consumes format_opts (it's no longer Copy — has a blocklisted
+    // bch_opts field), so capture the fields used afterward first.
+    let passphrase = format_opts.passphrase;
+    let superblock_size = format_opts.superblock_size;
 
-    let sb = crate::commands::format_util::bch2_format(fs_opt_strs, fs_opts, format_opts, dev_list);
+    let sb = crate::commands::format_util::format(fs_opt_strs, fs_opts, format_opts, std::slice::from_mut(&mut c_dev));
     if sb.is_null() {
-        bail!("bch2_format failed");
+        bail!("format failed");
     }
 
     let sb_offset_val = u64::from_le(unsafe { (*sb).layout.sb_offset[0] });
 
     // Add encryption key if needed
-    if !format_opts.passphrase.is_null() {
+    if !passphrase.is_null() {
         let type_cstr = CString::new("user").unwrap();
         let desc_cstr = CString::new("user").unwrap();
-        unsafe { c::bch2_add_key(sb, type_cstr.as_ptr(), desc_cstr.as_ptr(), format_opts.passphrase) };
+        unsafe { c::bch2_add_key(sb, type_cstr.as_ptr(), desc_cstr.as_ptr(), passphrase) };
     }
 
     unsafe { libc::free(sb as *mut _) };
@@ -430,6 +413,8 @@ fn migrate_fs(
     opt_set!(opts, sb, sb_offset_val);
     opt_set!(opts, nostart, true as u8);
     opt_set!(opts, noexcl, true as u8);
+    opt_set!(opts, reconcile_enabled, false as u8);
+    opt_set!(opts, copygc_enabled, false as u8);
 
     let fs = Fs::open(std::slice::from_ref(&dev_path_pb), opts)
         .map_err(|e| anyhow!("Error opening new filesystem: {}", e))?;
@@ -454,7 +439,7 @@ fn migrate_fs(
     // Calculate reserve_start: round up (superblock_size * 2 + BCH_SB_SECTOR) sectors
     // to bucket boundary (in bytes)
     let bucket_bytes = unsafe { (*(*fs.raw).devs[0]).mi.bucket_size as u64 } << 9;
-    let reserve_start = (((format_opts.superblock_size as u64 * 2 + c::BCH_SB_SECTOR as u64) << 9)
+    let reserve_start = (((superblock_size as u64 * 2 + c::BCH_SB_SECTOR as u64) << 9)
         .div_ceil(bucket_bytes)) * bucket_bytes;
 
     // Copy the filesystem tree
@@ -522,11 +507,10 @@ fn migrate_superblock(dev_path: &str, sb_offset: u64) -> Result<()> {
         .open(dev_path)
         .map_err(|e| anyhow!("Error opening {}: {}", dev_path, e))?;
 
-    let sb = super_io::__bch2_super_read(dev_file.as_raw_fd(), sb_offset);
-    let sb_ref = unsafe { &mut *sb };
+    let mut sb = super_io::super_read(dev_file.as_raw_fd(), sb_offset)?;
 
     // Validate and add default layout (catches errors early)
-    let sb_size = add_default_sb_layout(sb_ref)?;
+    let sb_size = add_default_sb_layout(sb.sb_mut())?;
 
     // Zero the start of the disk to blow away the old superblock
     let zeroes_len = ((c::BCH_SB_SECTOR as usize) << 9) + std::mem::size_of::<c::bch_sb>();
@@ -537,13 +521,15 @@ fn migrate_superblock(dev_path: &str, sb_offset: u64) -> Result<()> {
             .map_err(|e| anyhow!("Error zeroing start of disk: {}", e))?;
     }
     drop(dev_file);
-    unsafe { libc::free(sb as *mut _) };
+    drop(sb);
 
     // Open the filesystem with nostart + sb offset
     let dev_path_pb = std::path::PathBuf::from(dev_path);
     let mut opts: c::bch_opts = Default::default();
     opt_set!(opts, nostart, true as u8);
     opt_set!(opts, sb, sb_offset);
+    opt_set!(opts, reconcile_enabled, false as u8);
+    opt_set!(opts, copygc_enabled, false as u8);
 
     let fs = Fs::open(&[dev_path_pb], opts)
         .map_err(|e| anyhow!("Error opening filesystem: {}", e))?;
@@ -587,7 +573,7 @@ fn migrate_superblock(dev_path: &str, sb_offset: u64) -> Result<()> {
         .ok_or_else(|| anyhow!("device 0 not found"))?;
     fs.trans_mark_dev_sb(
         &ca_ref,
-        c::btree_iter_update_trigger_flags::BTREE_TRIGGER_transactional,
+        bcachefs_kernel::btree::iter::UpdateTriggerFlags::TRANSACTIONAL,
     ).map_err(|e| anyhow!("Error marking superblock buckets: {}", e))?;
     drop(ca_ref);
 
@@ -597,7 +583,7 @@ fn migrate_superblock(dev_path: &str, sb_offset: u64) -> Result<()> {
 
 // ---- Public command entry points ----
 
-pub fn cmd_migrate(argv: Vec<String>) -> Result<()> {
+fn cmd_migrate(argv: Vec<String>) -> Result<()> {
     let opt_flags = c::opt_flags::OPT_FORMAT as u32;
 
     let mut fs_path: Option<String> = None;
@@ -606,7 +592,7 @@ pub fn cmd_migrate(argv: Vec<String>) -> Result<()> {
     let mut force = false;
 
     let mut fs_opts: c::bch_opts = Default::default();
-    let mut deferred_opts: Vec<(usize, String)> = Vec::new();
+    let mut deferred_opts: Vec<(c::bch_opt_id, String)> = Vec::new();
 
     let mut i = 1;
     while i < argv.len() {
@@ -633,8 +619,8 @@ pub fn cmd_migrate(argv: Vec<String>) -> Result<()> {
                     };
 
                     match parse_opt_val(opt, &val_str)? {
-                        None => deferred_opts.push((opt_id as usize, val_str)),
-                        Some(v) => unsafe { c::bch2_opt_set_by_id(&mut fs_opts, opt_id, v) },
+                        None => deferred_opts.push((opt_id, val_str)),
+                        Some(v) => bcachefs_kernel::opts::opt_set_by_id(&mut fs_opts, opt_id, v),
                     }
                     i += 1;
                     continue;
@@ -690,7 +676,7 @@ pub fn cmd_migrate(argv: Vec<String>) -> Result<()> {
 
     // Handle encryption passphrase
     let passphrase: Option<Passphrase> = if encrypted && !no_passphrase {
-        Some(Passphrase::new_from_prompt_twice()?)
+        Some(Passphrase::ask_for_new_passphrase()?)
     } else {
         None
     };
@@ -703,13 +689,12 @@ pub fn cmd_migrate(argv: Vec<String>) -> Result<()> {
     let mut fs_opt_strs: c::bch_opt_strs = Default::default();
     for &(id, ref val) in &deferred_opts {
         let cstr = CString::new(val.as_str())?;
-        let ptr = unsafe { libc::strdup(cstr.as_ptr()) };
-        unsafe { fs_opt_strs.__bindgen_anon_1.by_id[id] = ptr };
+        fs_opt_strs.set(id, &cstr);
     }
 
     let result = migrate_fs(&fs_path, fs_opt_strs, fs_opts, fmt_opts, force);
 
-    unsafe { c::bch2_opt_strs_free(&mut fs_opt_strs) };
+    fs_opt_strs.free();
 
     result
 }
@@ -727,7 +712,9 @@ pub struct MigrateSuperblockCli {
     offset: u64,
 }
 
-pub fn cmd_migrate_superblock(argv: Vec<String>) -> Result<()> {
-    let cli = MigrateSuperblockCli::parse_from(argv);
+fn cmd_migrate_superblock(cli: MigrateSuperblockCli) -> Result<()> {
     migrate_superblock(&cli.device, cli.offset)
 }
+
+pub const CMD_MIGRATE: super::CmdDef = raw_cmd!("migrate", "Migrate existing filesystem to bcachefs", cmd_migrate);
+pub const CMD_MIGRATE_SUPERBLOCK: super::CmdDef = typed_cmd!("migrate-superblock", "Move superblock to standard location", MigrateSuperblockCli, cmd_migrate_superblock);

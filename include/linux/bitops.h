@@ -64,6 +64,14 @@ static inline int test_bit(long nr, const volatile unsigned long *addr)
 	return (*p & mask) != 0;
 }
 
+static inline int test_bit_acquire(long nr, const volatile unsigned long *addr)
+{
+	unsigned long mask = BIT_MASK(nr);
+	const unsigned long *p = ((const unsigned long *) addr) + BIT_WORD(nr);
+
+	return (__atomic_load_n(p, __ATOMIC_ACQUIRE) & mask) != 0;
+}
+
 static inline int __test_and_set_bit(int nr, unsigned long *addr)
 {
 	unsigned long mask = BIT_MASK(nr);

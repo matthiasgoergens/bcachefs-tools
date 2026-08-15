@@ -1,16 +1,19 @@
-use std::{collections::HashMap, env, ffi::CStr, mem, os::fd::{AsRawFd, OwnedFd}, path::{Path, PathBuf}};
+use std::{collections::HashMap, ffi::CStr, mem, os::fd::OwnedFd, path::{Path, PathBuf}};
 use chrono::{Local, TimeZone};
 
 use anyhow::{Context, Result};
 use bch_bindgen::c::{
-    BCH_SUBVOL_SNAPSHOT_RO, bch_ioctl_snapshot_node, bch_ioctl_subvol_dirent,
-    bch_ioctl_subvol_readdir,
+    BCH_SUBVOL_SNAPSHOT_RO, bch_ioctl_snapshot_node, bch_ioctl_snapshot_node_v2,
+    bch_ioctl_snapshot_tree_query, bch_ioctl_snapshot_tree_query_v2,
+    bch_ioctl_subvol_dirent, bch_ioctl_subvol_readdir, bch_ioctl_subvol_to_path,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
-use crate::util::fmt_sectors_human;
+use crate::util::{fmt_sectors_human, fmt_bytes_human, fmt_num_human, open_dir};
 use crate::wrappers::handle::BcachefsHandle;
-use crate::wrappers::ioctl::bch_ioc_wr;
+use crate::wrappers::ioctl::{ioctl_ptr, ioctl_rw, Ioctl, IoctlBuf,
+    BCH_IOCTL_SNAPSHOT_TREE, BCH_IOCTL_SNAPSHOT_TREE_v2,
+    BCH_IOCTL_SUBVOLUME_LIST, BCH_IOCTL_SUBVOLUME_TO_PATH};
 
 // ---- CLI definitions ----
 
@@ -34,7 +37,9 @@ enum Subcommands {
     #[command(visible_aliases = ["new"],
         long_about = "Creates a new subvolume at the given path. Subvolumes are \
 independently mountable filesystem trees, each with their own inode \
-number space.")]
+number space. Subvolume roots may be renamed or moved as subvolume \
+roots, but ordinary files and directories cannot be renamed across \
+subvolume boundaries.")]
     Create {
         /// Paths
         #[arg(required = true)]
@@ -53,9 +58,13 @@ number space.")]
     #[command(allow_missing_positional = true, visible_aliases = ["snap"],
         long_about = "Creates an instant, COW snapshot of a subvolume. Snapshots \
 initially share all data with the source and only consume additional \
-space as either diverges. Use --read-only for a frozen point-in-time \
-copy.")]
+space as either diverges. Snapshots are writable by default; use \
+--read-only for a frozen point-in-time copy.")]
     Snapshot {
+        /// Make snapshot writable (the default)
+        #[arg(long, conflicts_with = "read_only")]
+        rw: bool,
+
         /// Make snapshot read only
         #[arg(long, short)]
         read_only: bool,
@@ -98,7 +107,7 @@ machine-readable output. Sort by name, size, or creation time with \
         #[arg(long, value_enum)]
         sort: Option<SortBy>,
 
-        /// Filesystem (device, mountpoint, or UUID)
+	/// Directory in a mounted filesystem
         target: PathBuf,
     },
 
@@ -112,7 +121,8 @@ cumulative (total) usage per snapshot. Cumulative usage is the sum of \
 a snapshot's own usage plus all ancestors back to the root, \
 representing the total space that would be freed if deleted.\n\n\
 Use --json for machine-readable output including snapshot IDs, parent \
-relationships, and sector counts.")]
+relationships, and sector counts. Use --recursive (-R) to list snapshot \
+trees for nested subvolumes too.")]
     ListSnapshots {
         /// Show flat list instead of tree
         #[arg(long, short)]
@@ -130,7 +140,11 @@ relationships, and sector counts.")]
         #[arg(long, value_enum)]
         sort: Option<SortBy>,
 
-        /// Filesystem (device, mountpoint, or UUID)
+        /// List snapshots for nested subvolumes too
+        #[arg(long, short = 'R')]
+        recursive: bool,
+
+	/// Directory in a mounted filesystem
         target: PathBuf,
     },
 }
@@ -146,7 +160,7 @@ struct SubvolEntry {
     path: String,
 }
 
-type SnapshotNode = bch_ioctl_snapshot_node;
+type SnapshotNode = bch_ioctl_snapshot_node_v2;
 
 struct SnapshotTreeResult {
     master_subvol:  u32,
@@ -156,105 +170,64 @@ struct SnapshotTreeResult {
 
 // ---- Ioctl layer ----
 
-const BCH_IOCTL_SUBVOLUME_LIST: u32 = 31;
-const BCH_IOCTL_SUBVOLUME_TO_PATH: u32 = 32;
-const BCH_IOCTL_SNAPSHOT_TREE_USAGE: u32 = 33;
-
 const BCH_SUBVOLUME_RO:       u32 = 1 << 0;
 const BCH_SUBVOLUME_UNLINKED: u32 = 1 << 2;
 
-fn bcachefs_ioctl<T>(fd: &OwnedFd, nr: u32, arg: &mut T) -> std::io::Result<()> {
-    let ret = unsafe { libc::ioctl(fd.as_raw_fd(), bch_ioc_wr::<T>(nr), arg as *mut T) };
-    if ret < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-trait FlexArrayIoctl: Copy {
+/// A header-plus-flexible-array ioctl with capacity/total retry protocol:
+/// nr in is capacity, ERANGE reports the required total.
+trait FlexArrayIoctl: Sized {
     type Node: Copy;
-    const NR: u32;
+    type Ioc: Ioctl<Arg = Self>;
     fn set_capacity(&mut self, n: u32);
     fn nr(&self) -> u32;
     fn total(&self) -> u32;
+    /// The trailing array, through the struct's flexible array member.
+    /// Caller guarantees `nr` entries exist past the header.
+    unsafe fn nodes(&self, nr: usize) -> &[Self::Node];
 }
 
 fn bcachefs_flex_ioctl<H: FlexArrayIoctl>(
     fd: &OwnedFd,
     mut arg: H,
 ) -> Result<(H, Vec<H::Node>)> {
-    let hdr_size = mem::size_of::<H>();
-    let node_size = mem::size_of::<H::Node>();
-    let request = bch_ioc_wr::<H>(H::NR);
     let mut capacity = 256u32;
 
     loop {
         arg.set_capacity(capacity);
-        let buf_size = hdr_size + node_size * capacity as usize;
-        let mut buf = vec![0u8; buf_size];
+        let mut buf = IoctlBuf::<H>::new::<H::Node>(capacity as usize);
+        unsafe { std::ptr::copy_nonoverlapping(&arg, buf.as_mut_ptr(), 1) };
 
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                &arg as *const H as *const u8, buf.as_mut_ptr(), hdr_size);
-        }
-
-        let ret = unsafe { libc::ioctl(fd.as_raw_fd(), request, buf.as_mut_ptr()) };
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ERANGE) {
-                let hdr = unsafe { &*(buf.as_ptr() as *const H) };
-                capacity = hdr.total();
+        match unsafe { ioctl_ptr::<H::Ioc>(fd, buf.as_mut_ptr()) } {
+            Ok(_) => {}
+            Err(e) if e.raw_os_error() == Some(libc::ERANGE) => {
+                capacity = buf.hdr().total();
                 continue;
             }
-            return Err(err.into());
+            Err(e) => return Err(e.into()),
         }
 
-        let hdr = unsafe { *(buf.as_ptr() as *const H) };
-        let nr = hdr.nr() as usize;
-        let nodes = (0..nr).map(|i| unsafe {
-            std::ptr::read_unaligned(
-                buf.as_ptr().add(hdr_size + i * node_size) as *const H::Node)
-        }).collect();
-
-        return Ok((hdr, nodes));
+        let nr = (buf.hdr().nr() as usize).min(capacity as usize);
+        let nodes = unsafe { buf.hdr().nodes(nr) }.to_vec();
+        return Ok((unsafe { std::ptr::read(buf.hdr()) }, nodes));
     }
 }
 
-#[repr(C)]
-struct BchIoctlSubvolToPath {
-    subvolid:   u32,
-    buf_size:   u32,
-    buf:        u64,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Default)]
-struct BchIoctlSnapshotTreeQuery {
-    tree_id:        u32,
-    master_subvol:  u32,
-    root_snapshot:  u32,
-    nr:             u32,
-    total:          u32,
-    pad:            u32,
-}
-
-impl FlexArrayIoctl for BchIoctlSnapshotTreeQuery {
+impl FlexArrayIoctl for bch_ioctl_snapshot_tree_query {
     type Node = bch_ioctl_snapshot_node;
-    const NR: u32 = BCH_IOCTL_SNAPSHOT_TREE_USAGE;
+    type Ioc = BCH_IOCTL_SNAPSHOT_TREE;
     fn set_capacity(&mut self, n: u32) { self.nr = n; }
     fn nr(&self) -> u32 { self.nr }
     fn total(&self) -> u32 { self.total }
+    unsafe fn nodes(&self, nr: usize) -> &[Self::Node] { self.nodes.as_slice(nr) }
 }
 
-fn open_dir(path: &Path) -> Result<OwnedFd> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY)
-        .open(path)
-        .with_context(|| format!("Failed to open {}", path.display()))?;
-    Ok(f.into())
+impl FlexArrayIoctl for bch_ioctl_snapshot_tree_query_v2 {
+    type Node = bch_ioctl_snapshot_node_v2;
+    type Ioc = BCH_IOCTL_SNAPSHOT_TREE_v2;
+    fn set_capacity(&mut self, n: u32) { self.nr = n; }
+    fn nr(&self) -> u32 { self.nr }
+    fn total(&self) -> u32 { self.total }
+    unsafe fn nodes(&self, nr: usize) -> &[Self::Node] { self.nodes.as_slice(nr) }
 }
 
 fn subvol_readdir(fd: &OwnedFd, pos: &mut u32) -> Result<Vec<SubvolEntry>> {
@@ -268,7 +241,7 @@ fn subvol_readdir(fd: &OwnedFd, pos: &mut u32) -> Result<Vec<SubvolEntry>> {
         pad: 0,
     };
 
-    bcachefs_ioctl(fd, BCH_IOCTL_SUBVOLUME_LIST, &mut arg)
+    ioctl_rw::<BCH_IOCTL_SUBVOLUME_LIST>(fd, &mut arg)
         .context("BCH_IOCTL_SUBVOLUME_LIST")?;
     *pos = arg.pos;
 
@@ -314,13 +287,13 @@ fn list_children(fd: &OwnedFd) -> Result<Vec<SubvolEntry>> {
 
 fn subvol_to_path(fd: &OwnedFd, subvolid: u32) -> Result<String> {
     let mut buf = vec![0u8; 4096];
-    let mut arg = BchIoctlSubvolToPath {
+    let mut arg = bch_ioctl_subvol_to_path {
         subvolid,
         buf_size: buf.len() as u32,
         buf: buf.as_mut_ptr() as u64,
     };
 
-    bcachefs_ioctl(fd, BCH_IOCTL_SUBVOLUME_TO_PATH, &mut arg)
+    ioctl_rw::<BCH_IOCTL_SUBVOLUME_TO_PATH>(fd, &mut arg)
         .context("BCH_IOCTL_SUBVOLUME_TO_PATH")?;
 
     let path = CStr::from_bytes_until_nul(&buf)
@@ -335,16 +308,40 @@ fn resolve_subvol_path(fd: &OwnedFd, subvolid: u32) -> Option<String> {
 }
 
 fn query_snapshot_tree(fd: &OwnedFd, tree_id: u32) -> Result<SnapshotTreeResult> {
-    let (hdr, nodes) = bcachefs_flex_ioctl(fd, BchIoctlSnapshotTreeQuery {
+    match bcachefs_flex_ioctl(fd, bch_ioctl_snapshot_tree_query_v2 {
         tree_id,
+        node_size: mem::size_of::<bch_ioctl_snapshot_node_v2>() as u32,
         ..Default::default()
-    })?;
+    }) {
+        Ok((hdr, nodes)) => Ok(SnapshotTreeResult {
+            master_subvol: hdr.master_subvol,
+            root_snapshot: hdr.root_snapshot,
+            nodes,
+        }),
+        /* Kernel predates v2: fall back, without the key counters */
+        Err(e) if e.downcast_ref::<std::io::Error>()
+            .and_then(|e| e.raw_os_error()) == Some(libc::ENOTTY) => {
+            let (hdr, v1) = bcachefs_flex_ioctl(fd, bch_ioctl_snapshot_tree_query {
+                tree_id,
+                ..Default::default()
+            })?;
 
-    Ok(SnapshotTreeResult {
-        master_subvol: hdr.master_subvol,
-        root_snapshot: hdr.root_snapshot,
-        nodes,
-    })
+            Ok(SnapshotTreeResult {
+                master_subvol: hdr.master_subvol,
+                root_snapshot: hdr.root_snapshot,
+                nodes: v1.iter().map(|n| bch_ioctl_snapshot_node_v2 {
+                    id:       n.id,
+                    parent:   n.parent,
+                    children: n.children,
+                    subvol:   n.subvol,
+                    flags:    n.flags,
+                    sectors:  n.sectors,
+                    ..Default::default()
+                }).collect(),
+            })
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn compute_subvol_sizes(tree: &SnapshotTreeResult) -> HashMap<u32, u64> {
@@ -449,7 +446,7 @@ fn print_flat(dir: &Path, recursive: bool, show_snapshots: bool,
                 let sb = sizes.as_ref().and_then(|s| s.get(&b.1.subvolid)).copied().unwrap_or(0);
                 sb.cmp(&sa)
             }),
-            SortBy::Time => entries.sort_by(|a, b| b.1.otime_sec.cmp(&a.1.otime_sec)),
+            SortBy::Time => entries.sort_by_key(|b| std::cmp::Reverse(b.1.otime_sec)),
         }
     }
 
@@ -596,7 +593,8 @@ fn snapshot_node_label(id: u32, node: &SnapshotNode, names: &HashMap<u32, String
     let name = names.get(&id)
         .cloned()
         .unwrap_or_else(|| "(shared)".to_string());
-    let mut label = format!("{} [{}]", name, fmt_sectors_human(node.sectors));
+    let mut label = format!("{} [{}, {} keys]", name,
+        fmt_sectors_human(node.sectors), fmt_num_human(node.nr_keys));
     let f = flags_str(node.flags);
     if !f.is_empty() {
         label.push_str(&format!(" ({})", f));
@@ -690,20 +688,22 @@ fn print_snapshot_flat(dir: &Path, readonly: bool, sort: Option<SortBy>) -> Resu
     if let Some(ref sort) = sort {
         match sort {
             SortBy::Name => entries.sort_by(|a, b| a.0.cmp(&b.0)),
-            SortBy::Size => entries.sort_by(|a, b| b.2.cmp(&a.2)),
+            SortBy::Size => entries.sort_by_key(|b| std::cmp::Reverse(b.2)),
             SortBy::Time => {}
         }
     }
 
-    println!("{:<24} {:<8} {:<12} {:<12} Flags",
-        "Path", "ID", "Own", "Total");
+    println!("{:<24} {:<8} {:<12} {:<10} {:<8} {:<12} Flags",
+        "Path", "ID", "Own", "Meta", "Keys", "Total");
 
     for (path, n, cumulative) in &entries {
         let f = flags_str(n.flags);
         let flags_display = if f.is_empty() { "-".to_string() } else { f };
-        println!("{:<24} {:<8} {:<12} {:<12} {}",
+        println!("{:<24} {:<8} {:<12} {:<10} {:<8} {:<12} {}",
             path, n.subvol,
             fmt_sectors_human(n.sectors),
+            fmt_bytes_human(n.key_bytes),
+            fmt_num_human(n.nr_keys),
             fmt_sectors_human(*cumulative),
             flags_display);
     }
@@ -711,7 +711,7 @@ fn print_snapshot_flat(dir: &Path, readonly: bool, sort: Option<SortBy>) -> Resu
     Ok(())
 }
 
-fn print_snapshot_json(dir: &Path) -> Result<()> {
+fn snapshot_json_value(dir: &Path) -> Result<serde_json::Value> {
     let fd = open_dir(dir)?;
     let tree = query_snapshot_tree(&fd, 0)?;
 
@@ -724,6 +724,8 @@ fn print_snapshot_json(dir: &Path) -> Result<()> {
             "subvol":   n.subvol,
             "sectors":  n.sectors,
             "size":     fmt_sectors_human(n.sectors),
+            "nr_keys":  n.nr_keys,
+            "key_bytes": n.key_bytes,
         });
         let f = flags_str(n.flags);
         if !f.is_empty() {
@@ -745,43 +747,74 @@ fn print_snapshot_json(dir: &Path) -> Result<()> {
         query_root["path"] = path.into();
     }
 
-    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+    Ok(serde_json::json!({
         "query_root": query_root,
         "nodes":      nodes_json,
-    }))?);
+    }))
+}
+
+fn print_snapshot_json(dir: &Path) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(&snapshot_json_value(dir)?)?);
     Ok(())
+}
+
+fn collect_snapshot_targets(dir: &Path, recursive: bool) -> Result<Vec<(String, PathBuf)>> {
+    let mut targets = vec![(dir.display().to_string(), dir.to_path_buf())];
+
+    if recursive {
+        for (path, entry) in collect_entries(dir, "", true)? {
+            if entry.snapshot_parent == 0 {
+                targets.push((path.clone(), dir.join(path)));
+            }
+        }
+    }
+
+    Ok(targets)
 }
 
 // ---- Command handlers ----
 
-pub fn subvolume(argv: Vec<String>) -> Result<()> {
-    let cli = Cli::parse_from(argv);
+fn subvolume(cli: Cli) -> Result<()> {
 
     match cli.subcommands {
         Subcommands::Create { targets }                                         => cmd_create(targets),
         Subcommands::Delete { targets }                                         => cmd_delete(targets),
-        Subcommands::Snapshot { read_only, source, dest }                       => cmd_snapshot(read_only, source, dest),
+        /* rw is the default, so it only has to not contradict --read-only -
+         * which clap enforces, so there's nothing left for it to say here: */
+        Subcommands::Snapshot { read_only, source, dest, rw: _ }                => cmd_snapshot(read_only, source, dest),
         Subcommands::List { json, tree, recursive, snapshots, readonly, sort, target }
                                                                                 => cmd_list(json, tree, recursive, snapshots, readonly, sort, target),
-        Subcommands::ListSnapshots { flat, json, readonly, sort, target }       => cmd_list_snapshots(flat, json, readonly, sort, target),
+        Subcommands::ListSnapshots { flat, json, readonly, sort, recursive, target }
+                                                                                => cmd_list_snapshots(flat, json, readonly, sort, recursive, target),
     }
+}
+
+/// Open a handle on the filesystem @path is in, or will be in.
+///
+/// The handle only selects which filesystem to send the ioctl to: the
+/// subvolume ioctls carry their own dirfd and path and resolve it themselves.
+/// So any file in the right filesystem will do - and for a path that doesn't
+/// exist yet, that's the nearest ancestor that does. Walking too far - past a
+/// mountpoint, onto a different bcachefs - is caught by the kernel, which
+/// checks the resolved path against the filesystem the ioctl came in on and
+/// returns EXDEV.
+///
+/// A relative path's last ancestor is "", which never exists: that's the cwd.
+fn fs_for_path(path: &Path) -> Result<BcachefsHandle> {
+    let dir = path
+        .ancestors()
+        .find(|p| p.exists())
+        .unwrap_or(Path::new("."));
+
+    BcachefsHandle::open(dir)
+        .with_context(|| format!("Failed to open the filesystem at {}", dir.display()))
 }
 
 fn cmd_create(targets: Vec<PathBuf>) -> Result<()> {
     for target in targets {
-        let target = if target.is_absolute() {
-            target
-        } else {
-            env::current_dir()
-                .map(|p| p.join(target))
-                .context("unable to get current directory")?
-        };
-
-        if let Some(dirname) = target.parent() {
-            let fs = BcachefsHandle::open(dirname).context("Failed to open the filesystem")?;
-            fs.create_subvolume(target)
-                .context("Failed to create the subvolume")?;
-        }
+        fs_for_path(&target)?
+            .create_subvolume(target)
+            .context("Failed to create the subvolume")?;
     }
     Ok(())
 }
@@ -792,28 +825,21 @@ fn cmd_delete(targets: Vec<PathBuf>) -> Result<()> {
             .canonicalize()
             .context("subvolume path does not exist or can not be canonicalized")?;
 
-        if let Some(dirname) = target.parent() {
-            let fs = BcachefsHandle::open(dirname).context("Failed to open the filesystem")?;
-            fs.delete_subvolume(target)
-                .context("Failed to delete the subvolume")?;
-        }
+        fs_for_path(&target)?
+            .delete_subvolume(target)
+            .context("Failed to delete the subvolume")?;
     }
     Ok(())
 }
 
 fn cmd_snapshot(read_only: bool, source: Option<PathBuf>, dest: PathBuf) -> Result<()> {
-    if let Some(dirname) = dest.parent() {
-        let dot = PathBuf::from(".");
-        let dir = if dirname.as_os_str().is_empty() { &dot } else { dirname };
-        let fs = BcachefsHandle::open(dir).context("Failed to open the filesystem")?;
-
-        fs.snapshot_subvolume(
+    fs_for_path(&dest)?
+        .snapshot_subvolume(
             if read_only { BCH_SUBVOL_SNAPSHOT_RO } else { 0x0 },
             source,
             dest,
         )
         .context("Failed to snapshot the subvolume")?;
-    }
     Ok(())
 }
 
@@ -834,13 +860,42 @@ fn cmd_list(json: bool, tree: bool, recursive: bool, snapshots: bool,
 }
 
 fn cmd_list_snapshots(flat: bool, json: bool, readonly: bool,
-                      sort: Option<SortBy>, target: PathBuf) -> Result<()> {
-    if json {
+                      sort: Option<SortBy>, recursive: bool, target: PathBuf) -> Result<()> {
+    let targets = collect_snapshot_targets(&target, recursive)?;
+
+    if json && recursive {
+        let mut result = Vec::new();
+        for (path, dir) in &targets {
+            result.push(serde_json::json!({
+                "path": path,
+                "snapshots": snapshot_json_value(dir)?,
+            }));
+        }
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if json {
         print_snapshot_json(&target)?;
     } else if flat {
-        print_snapshot_flat(&target, readonly, sort)?;
+        for (i, (path, dir)) in targets.iter().enumerate() {
+            if recursive {
+                if i != 0 {
+                    println!();
+                }
+                println!("{}:", path);
+            }
+            print_snapshot_flat(dir, readonly, sort.clone())?;
+        }
     } else {
-        print_snapshot_tree(&target)?;
+        for (i, (path, dir)) in targets.iter().enumerate() {
+            if recursive {
+                if i != 0 {
+                    println!();
+                }
+                println!("{}:", path);
+            }
+            print_snapshot_tree(dir)?;
+        }
     }
     Ok(())
 }
+
+pub const CMD: super::CmdDef = typed_cmd!("subvolume", "Manage subvolumes and snapshots", aliases: ["subvol"], Cli, subvolume);
