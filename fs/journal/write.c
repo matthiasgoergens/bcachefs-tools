@@ -659,6 +659,24 @@ static CLOSURE_CALLBACK(journal_write_preflush)
 
 	if (w->separate_flush) {
 		for_each_rw_member(c, ca, BCH_DEV_WRITE_REF_journal_write) {
+			/*
+			 * Scoped preflush (stage 3): the preflush round must
+			 * reach every device the entries this write seals can
+			 * reference. Devices that owed no durability debt at
+			 * pick time (flush_devs is exchanged out of
+			 * c->journal_debt when the flush write is picked) and
+			 * hold no journal copy cannot be referenced: any write
+			 * whose key can appear in the sealed entry published
+			 * after its endio, so its debt was registered before
+			 * the exchange. Journal devices always stay in the
+			 * round (their noflush entries ride the same
+			 * preflush).
+			 */
+			if (c->opts.scoped_preflush &&
+			    !test_bit(ca->dev_idx, w->flush_devs.d) &&
+			    !ca->journal.nr)
+				continue;
+
 			enumerated_ref_get(&ca->io_ref[WRITE],
 					   BCH_DEV_WRITE_REF_journal_write);
 

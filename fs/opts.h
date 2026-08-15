@@ -358,6 +358,17 @@ enum fsck_err_opts {
 			"written as cached replicas and flipped authoritative\n"\
 			"only once their durability debt is discharged,\n"\
 			"keeping slow-target flushes off the fsync path")	\
+	x(scoped_preflush,		u8,				\
+	  OPT_FS|OPT_MOUNT,						\
+	  OPT_BOOL(),							\
+	  BCH2_NO_SB_OPT,		false,				\
+	  NULL,		"Stage 3: the journal flush write's preflush round\n"\
+			"goes only to devices that owed durability debt at\n"\
+			"pick time (c->journal_debt -> flush_devs) plus the\n"\
+			"journal devices, instead of every rw member. The\n"\
+			"debt tracking is the prerequisite: naive narrowing\n"\
+			"without it was measured corrupting by the crash\n"\
+			"battery.")	\
 	x(journal_reclaim_delay,	u32,				\
 	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
 	  OPT_UINT(0, U32_MAX),						\
