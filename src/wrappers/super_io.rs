@@ -78,9 +78,21 @@ pub extern "C" fn bch2_super_write(fd: i32, sb: *mut c::bch_sb) {
 
         let sb_bytes = vstruct_bytes_sb(unsafe { &*sb });
         let write_len = round_up(sb_bytes, bs);
-        let sb_slice = unsafe { std::slice::from_raw_parts(sb as *const u8, write_len) };
 
-        pwrite_exact(&file, sb_slice, offset_sectors << 9);
+        if write_len > sb_bytes {
+            // The C sb buffer is only sized to the sb itself; writing
+            // round_up(sb_bytes, bs) bytes from it reads past the
+            // allocation. Zero-pad the remainder instead.
+            let sb_slice =
+                unsafe { std::slice::from_raw_parts(sb as *const u8, sb_bytes) };
+            let mut buf = vec![0u8; write_len];
+            buf[..sb_bytes].copy_from_slice(sb_slice);
+            pwrite_exact(&file, &buf, offset_sectors << 9);
+        } else {
+            let sb_slice =
+                unsafe { std::slice::from_raw_parts(sb as *const u8, write_len) };
+            pwrite_exact(&file, sb_slice, offset_sectors << 9);
+        }
     }
 
     if let Err(e) = rustix::fs::fsync(&*file) {
