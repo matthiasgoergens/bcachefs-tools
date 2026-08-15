@@ -1455,7 +1455,7 @@ int bch2_data_update_init(struct btree_trans *trans,
 	    m->opts.ptrs_kill &&
 	    m->opts.target != io_opts->foreground_target &&
 	    !io_opts->nocow &&
-	    durability_total >= io_opts->data_replicas &&
+	    durability_total == io_opts->data_replicas &&
 	    bch2_demote_flip_room(c)) {
 		bool eligible = true;
 
@@ -1465,10 +1465,60 @@ int bch2_data_update_init(struct btree_trans *trans,
 				break;
 			}
 
+		/*
+		 * The flip's legs land on background_target devices and
+		 * must cover the durability of the ptrs they kill. If no
+		 * target device can match a killed ptr's durability, the
+		 * try-time subset kill could never kill it and the demote
+		 * would loop forever - decline and let the fused path
+		 * handle the imbalance with its own accounting. (An
+		 * over-replicated extent is declined above via the ==
+		 * check, so the index update's extra-durability drop
+		 * cannot shift ptr positions under the flip's mask.)
+		 */
+		scoped_guard(rcu) {
+			/*
+			 * Every device the allocator may pick for the leg
+			 * (m->opts.target - the write's actual target, not
+			 * the option) must be able to cover a killed ptr:
+			 * a leg on a weaker device would leave the
+			 * try-time subset kill with nothing coverable -
+			 * the flip drops, reconcile re-demotes, the gate
+			 * passes again: a livelock. The minimum, not the
+			 * maximum, decides; the fused path's durability
+			 * accounting handles declined extents.
+			 */
+			const struct bch_devs_mask *tmask =
+				bch2_target_to_mask(c, m->opts.target);
+			unsigned target_min = UINT_MAX;
+			for_each_member_device_rcu(c, ca, tmask)
+				target_min = min(target_min, ca->mi.durability);
+
+			unsigned ptr_bit2 = 1;
+			bkey_for_each_ptr_decode(k.k, ptrs, p, entry) {
+				if ((ptr_bit2 & m->opts.ptrs_kill) &&
+				    bch2_dev_durability(c, p.ptr.dev) > target_min) {
+					eligible = false;
+					break;
+				}
+				ptr_bit2 <<= 1;
+			}
+		}
+
 		if (eligible) {
 			m->flip_ptrs_kill	= m->opts.ptrs_kill;
 			m->opts.ptrs_kill	= 0;
-			m->opts.extra_replicas	= 1;
+			/*
+			 * Write one cached leg per ptr the flip will kill:
+			 * the flip's atomic key update promotes the legs
+			 * and caches the killed ptrs together, so the
+			 * authoritative count never drops below
+			 * data_replicas (stage-2 staged-flip invariant;
+			 * the selector caps the kill at one ptr per op,
+			 * but mixed kills - e.g. checksum plus target -
+			 * can still carry two bits).
+			 */
+			m->opts.extra_replicas	= hweight_long(m->flip_ptrs_kill);
 
 			/*
 			 * The killed ptrs stay authoritative until the flip

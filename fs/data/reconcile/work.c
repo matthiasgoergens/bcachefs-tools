@@ -652,9 +652,22 @@ skip_ec:
 			    p.crc.compression_type != compression_type)
 				data_opts->ptrs_kill |= ptr_bit;
 
+			/*
+			 * Stage-2 cached-leg demote: kill at most ONE
+			 * background-target ptr per op. The flip caches
+			 * the killed ptr and promotes an equal number of
+			 * cached legs, so the extent never drops below
+			 * data_replicas authoritative copies; reconcile
+			 * re-evaluates the committed key and re-demotes
+			 * the remaining ptrs in later ops. The plain
+			 * (fused) path is unaffected in the common
+			 * one-ptr case and merely splits multi-ptr
+			 * demotes when the gate is enabled.
+			 */
 			if ((r->need_rb & BIT(BCH_RECONCILE_background_target)) &&
 			    !p.ptr.cached &&
-			    !bch2_dev_in_target_rcu(c, p.ptr.dev, r->background_target))
+			    !bch2_dev_in_target_rcu(c, p.ptr.dev, r->background_target) &&
+			    !(c->opts.demote_cached_leg && data_opts->ptrs_kill))
 				data_opts->ptrs_kill |= ptr_bit;
 
 			ptr_bit <<= 1;

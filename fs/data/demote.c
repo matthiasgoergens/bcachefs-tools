@@ -9,8 +9,12 @@
  * (bch2_journal_debt_ticket_covered()) and then commits ONE atomic key
  * update: the cached ptrs become authoritative and the deferred
  * ptrs_kill ptrs become cached. Invariant: at every instant the design
- * controls, the extent has >= data_replicas authoritative-durable
- * copies; the transient states carry a cached surplus.
+ * controls, the extent has >= data_replicas AUTHORITATIVE copies; the
+ * flip promotes as many cached legs as it kills ptrs (the demote
+ * selector kills at most one ptr per op, the update writes one leg
+ * per killed ptr), so the authoritative count is monotone across the
+ * transition and the cached surplus is never load-bearing for the
+ * invariant.
  *
  * Revalidation is EXACT: the arm re-reads the published key and records
  * it; the flip commits only if the current key is byte-identical
@@ -82,6 +86,13 @@ void bch2_demote_flip_arm(struct data_update *u)
 	f->btree_id	= u->btree_id;
 	f->pos		= u->pos;
 	bch2_bkey_buf_init(&f->k);
+
+	/*
+	 * The mask was computed against the key the op started from; the
+	 * index update may have rewritten the published key in between
+	 * (extra-durability drops, cached ptr cleanup), shifting ptr
+	 * positions. Remap below once the published key is re-read.
+	 */
 	f->flip_ptrs_kill = u->flip_ptrs_kill;
 
 	/*
@@ -104,6 +115,9 @@ void bch2_demote_flip_arm(struct data_update *u)
 		peeked = k;
 		if (k.k) {
 			bch2_bkey_buf_reassemble(&f->k, k);
+			f->flip_ptrs_kill =
+				ptr_mask_remap(c, bkey_i_to_s_c(u->k.k),
+					       u->flip_ptrs_kill, k);
 
 			struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(k);
 			const struct bch_extent_ptr *ptr;
@@ -208,6 +222,8 @@ static bool demote_flip_try(struct bch_fs *c, struct demote_flip *f)
 			bkey_start_pos(&f->k.k->k),
 			BTREE_ITER_slots|BTREE_ITER_intent,
 			k, &res.r, NULL, 0, ({
+		int _ret = 0;
+
 		/* walk the published key's range; break only past it - the
 		 * key AT the published pos is the match candidate (le broke
 		 * on equality and every flip dropped, measured) */
@@ -223,20 +239,90 @@ static bool demote_flip_try(struct bch_fs *c, struct demote_flip *f)
 
 		f->updated = true;
 
-		struct bkey_i *new = errptr_try(bch2_bkey_make_mut_noupdate(trans, k));
-		struct bkey_ptrs ptrs = bch2_bkey_ptrs(bkey_i_to_s(new));
-		struct bch_extent_ptr *ptr;
-		unsigned ptr_bit = 1;
+		/*
+		 * Staged-flip invariant, in durability units: the flip may
+		 * cache a killed ptr only against leg durability that
+		 * actually covers it. Compute the leg and kill durability
+		 * from the devices the op really wrote to / the ptrs it
+		 * really kills, and shrink the kill mask to a coverable
+		 * subset (first-fit - under-killing is safe); the
+		 * uncovered ptrs stay authoritative and reconcile
+		 * re-demotes them in later ops.
+		 */
+		unsigned kill_mask = f->flip_ptrs_kill;
+		{
+			unsigned legs_durability = 0, kill_durability = 0;
+			unsigned dev;
+			for_each_set_bit(dev, f->devs.d, BCH_SB_MEMBERS_MAX)
+				legs_durability += bch2_dev_durability(c, dev);
 
-		bkey_for_each_ptr(ptrs, ptr) {
-			if (ptr->cached && test_bit(ptr->dev, f->devs.d))
-				ptr->cached = false;
-			if (ptr_bit & f->flip_ptrs_kill)
-				ptr->cached = true;
-			ptr_bit <<= 1;
+			const union bch_extent_entry *entry;
+			struct extent_ptr_decoded p;
+			unsigned ptr_bit = 1;
+			bkey_for_each_ptr_decode(k.k, bch2_bkey_ptrs_c(k), p, entry) {
+				if (ptr_bit & kill_mask)
+					kill_durability += bch2_dev_durability(c, p.ptr.dev);
+				ptr_bit <<= 1;
+			}
+
+			if (legs_durability < kill_durability) {
+				unsigned covered = 0, subset = 0;
+				ptr_bit = 1;
+				bkey_for_each_ptr_decode(k.k, bch2_bkey_ptrs_c(k), p, entry) {
+					unsigned d = bch2_dev_durability(c, p.ptr.dev);
+					if ((ptr_bit & kill_mask) &&
+					    covered + d <= legs_durability) {
+						covered += d;
+						subset |= ptr_bit;
+					}
+					ptr_bit <<= 1;
+				}
+				kill_mask = subset;
+			}
 		}
 
-		bch2_trans_update(trans, &iter, new, 0);
+		if (kill_mask) {
+			struct bkey_i *new = errptr_try(bch2_bkey_make_mut_noupdate(trans, k));
+			struct bkey_ptrs ptrs = bch2_bkey_ptrs(bkey_i_to_s(new));
+			struct bch_extent_ptr *ptr;
+			unsigned ptr_bit = 1;
+
+			bkey_for_each_ptr(ptrs, ptr) {
+				if (ptr->cached && test_bit(ptr->dev, f->devs.d))
+					ptr->cached = false;
+				if (ptr_bit & kill_mask)
+					ptr->cached = true;
+				ptr_bit <<= 1;
+			}
+
+			if (IS_ENABLED(CONFIG_BCACHEFS_DEBUG)) {
+				/*
+				 * Staged-flip invariant: the extent's total
+				 * durability must never drop across a flip -
+				 * the flip promotes exactly the leg durability
+				 * it kills against, so the extent never goes
+				 * below data_replicas.
+				 */
+				struct bkey_durability pre = {}, post = {};
+				int pre_ret = bch2_bkey_durability(trans, k, &pre);
+				int post_ret = bch2_bkey_durability(trans, bkey_i_to_s_c(new), &post);
+
+				if (!pre_ret && !post_ret && post.total < pre.total)
+					bch_err_ratelimited(c,
+						"demote flip: durability DROPPED %u -> %u (kill 0x%x) %llu:%llu",
+						pre.total, post.total, kill_mask,
+						f->k.k->k.p.inode, f->k.k->k.p.offset);
+			}
+
+			_ret = bch2_trans_update(trans, &iter, new, 0);
+		} else {
+			/*
+			 * Nothing coverable: drop the flip - the cached legs
+			 * are GC'd and reconcile re-demotes the ptrs.
+			 */
+			f->updated = false;
+		}
+		_ret;
 	}));
 
 	if (ret && IS_ENABLED(CONFIG_BCACHEFS_DEBUG)) {
