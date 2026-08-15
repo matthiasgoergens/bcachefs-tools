@@ -407,7 +407,18 @@ void bch2_disk_path_to_text(struct printbuf *out, struct bch_fs *c, unsigned v)
 {
 	guard(printbuf_atomic)(out);
 	guard(rcu)();
-	__bch2_disk_path_to_text(out, rcu_dereference(c->disk_groups), v);
+
+	/* May be called with a NULL fs (e.g. while printing a validation
+	 * error for a corrupt superblock section): __bch2_disk_path_to_text()
+	 * handles a NULL groups pointer. Keep the NULL check explicit — the
+	 * compiler will not preserve a ternary guard around rcu_dereference().
+	 */
+	struct bch_disk_groups_cpu *g = NULL;
+
+	if (c)
+		g = rcu_dereference(c->disk_groups);
+
+	__bch2_disk_path_to_text(out, g, v);
 }
 
 void bch2_disk_path_to_text_sb(struct printbuf *out, struct bch_sb *sb, unsigned v)
