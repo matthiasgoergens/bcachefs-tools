@@ -365,15 +365,25 @@ static bool demote_flip_try(struct bch_fs *c, struct demote_flip *f)
 		 */
 		unsigned kill_mask = flip_ptrs_kill;
 		{
+			/*
+			 * legs_durability must be the durability the commit
+			 * ACTUALLY promotes: the current key's cached ptrs on
+			 * the leg devices - never f->devs itself, which can
+			 * be stale (a leg dropped from the current key while
+			 * another survives would let the shrink over-count
+			 * and cache more authoritative durability than the
+			 * flip replaces). The match path is equivalent
+			 * (byte-identity guarantees all leg ptrs present);
+			 * the re-derive path is only correct this way.
+			 */
 			unsigned legs_durability = 0, kill_durability = 0;
-			unsigned dev;
-			for_each_set_bit(dev, f->devs.d, BCH_SB_MEMBERS_MAX)
-				legs_durability += bch2_dev_durability(c, dev);
-
 			const union bch_extent_entry *entry;
 			struct extent_ptr_decoded p;
 			unsigned ptr_bit = 1;
 			bkey_for_each_ptr_decode(k.k, bch2_bkey_ptrs_c(k), p, entry) {
+				if (p.ptr.cached &&
+				    test_bit(p.ptr.dev, f->devs.d))
+					legs_durability += bch2_dev_durability(c, p.ptr.dev);
 				if (ptr_bit & kill_mask)
 					kill_durability += bch2_dev_durability(c, p.ptr.dev);
 				ptr_bit <<= 1;
@@ -421,11 +431,22 @@ static bool demote_flip_try(struct bch_fs *c, struct demote_flip *f)
 				int pre_ret = bch2_bkey_durability(trans, k, &pre);
 				int post_ret = bch2_bkey_durability(trans, bkey_i_to_s_c(new), &post);
 
-				if (!pre_ret && !post_ret && post.total < pre.total)
-					bch_err_ratelimited(c,
+				if (!pre_ret && !post_ret && post.total < pre.total) {
+					/*
+					 * Fail hard in DEBUG builds: the staged
+					 * flip's whole point is that the extent
+					 * never drops below data_replicas. A
+					 * log-only warning would let a broken
+					 * flip commit and then be lost in CI
+					 * noise (measured: the ratelimiters
+					 * already suppress the flip logs).
+					 */
+					bch_err(c,
 						"demote flip: durability DROPPED %u -> %u (kill 0x%x) %llu:%llu",
 						pre.total, post.total, kill_mask,
 						f->k.k->k.p.inode, f->k.k->k.p.offset);
+					BUG();
+				}
 			}
 
 			_ret = bch2_trans_update(trans, &iter, new, 0);
