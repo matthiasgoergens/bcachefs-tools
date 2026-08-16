@@ -286,7 +286,7 @@ static bool demote_flip_try(struct bch_fs *c, struct demote_flip *f)
 
 				/* is this exact leg ptr in the recorded key? */
 				struct bkey_ptrs_c rptrs =
-					bch2_bkey_ptrs_c(bkey_i_to_s_c(&f->k.k->k));
+					bch2_bkey_ptrs_c(bkey_i_to_s_c(f->k.k));
 				const struct bch_extent_ptr *rptr;
 				bool found = false;
 
@@ -294,7 +294,7 @@ static bool demote_flip_try(struct bch_fs *c, struct demote_flip *f)
 					if (rptr->cached &&
 					    rptr->dev == cptr->dev &&
 					    rptr->offset == cptr->offset &&
-					    rptr->gen == cptr->gen) {
+					    rptr->generation == cptr->generation) {
 						found = true;
 						break;
 					}
@@ -323,7 +323,7 @@ static bool demote_flip_try(struct bch_fs *c, struct demote_flip *f)
 			}
 
 			flip_ptrs_kill = ptr_mask_remap(c,
-					bkey_i_to_s_c(&f->k.k->k),
+					bkey_i_to_s_c(f->k.k),
 					f->flip_ptrs_kill, k);
 
 			/*
