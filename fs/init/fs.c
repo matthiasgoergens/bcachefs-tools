@@ -28,6 +28,7 @@
 #include "data/checksum.h"
 #include "data/compress.h"
 #include "data/copygc.h"
+#include "data/demote.h"
 #include "data/ec/create.h"
 #include "data/ec/init.h"
 #include "data/move.h"
@@ -674,6 +675,7 @@ static void __bch2_fs_free(struct bch_fs *c)
 	bch2_fs_reconcile_exit(c);
 	bch2_fs_quota_exit(c);
 	bch2_fs_nocow_locking_exit(c);
+	bch2_demote_flip_exit(c);
 	bch2_fs_journal_exit(&c->journal);
 	bch2_fs_io_write_exit(c);
 	bch2_fs_io_read_exit(c);

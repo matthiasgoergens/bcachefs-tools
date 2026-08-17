@@ -1530,6 +1530,24 @@ static void bch2_write_endio(struct bio *bio)
 		op->io_error = true;
 	}
 
+	/*
+	 * A successful non-FUA completion leaves durability debt the next
+	 * flushing journal write must cover: this write's key (foreground,
+	 * move or nocow-conversion target) is journaled off this endio. A
+	 * successful FUA completion is its own barrier and owes nothing.
+	 */
+	if (ca && likely(!bio->bi_status) && !(bio->bi_opf & REQ_FUA)) {
+		u64 ticket = bch2_journal_debt_add(c, wbio->dev);
+
+		/* stage 2: the cached-leg flip waits for the coverage of
+		 * this write's debt; the last ticket per device is the
+		 * one that matters (completion generations are monotone) */
+		if (op->flags & BCH_WRITE_move) {
+			op->debt_tickets[wbio->dev] = ticket;
+			__set_bit(wbio->dev, op->written_devs.d);
+		}
+	}
+
 	if (wbio->nocow) {
 		bch2_bucket_nocow_unlock(&c->nocow_locks,
 					 POS(ca->dev_idx, wbio->nocow_bucket),

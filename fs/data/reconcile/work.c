@@ -18,6 +18,7 @@
 #include "data/ec/create.h"
 #include "data/ec/trigger.h"
 #include "data/move.h"
+#include "data/demote.h"
 #include "data/reconcile/work.h"
 #include "data/write.h"
 
@@ -432,6 +433,39 @@ static int reconcile_set_data_opts(struct btree_trans *trans,
 	if (!r || !r->need_rb) /* Write buffer race? */
 		return 0;
 
+	/*
+	 * Another data update is already in flight for this exact key
+	 * (the update table excludes nothing by default - measured: the
+	 * logical and physical reconcile workers start updates on the
+	 * same extent, each update then loses the extents_match check
+	 * and discards, so the demote leg never lands and the extent is
+	 * re-demoted forever). Restart: by the retry the other update
+	 * has finished and removed itself from the table.
+	 */
+	if (bch2_data_update_in_flight(c, &(struct bbpos) {
+					.btree = iter->btree_id,
+					.pos = k.k->p },
+				     BCH_DATA_UPDATE_reconcile))
+		return bch_err_throw(c, transaction_restart);
+
+	/*
+	 * A cached-leg demote flip is pending for this exact key: the flip
+	 * owns the transition and recomputes reconcile state when it
+	 * commits. Processing now would rewrite the key and abort the
+	 * flip's exact-match revalidation - and re-demote this extent in a
+	 * loop that starves the flip of a commit window (measured: 500+
+	 * flip writes in 900s with zero commits). Skip it without touching
+	 * the key: a restart here would spin and keep hammering the same
+	 * btree paths the flip's transaction needs, which is the same
+	 * starvation in a different shape (measured again). The durable
+	 * entry stays; when the flip commits or drops, a later pass
+	 * recomputes nothing-to-do or re-runs the demote.
+	 */
+	if (bch2_demote_flip_pending(c, (struct bbpos) {
+					.btree = iter->btree_id,
+					.pos = k.k->p }))
+		return 0;
+
 	data_opts->type			= BCH_DATA_UPDATE_reconcile;
 	data_opts->target		= r->background_target;
 
@@ -618,9 +652,22 @@ skip_ec:
 			    p.crc.compression_type != compression_type)
 				data_opts->ptrs_kill |= ptr_bit;
 
+			/*
+			 * Stage-2 cached-leg demote: kill at most ONE
+			 * background-target ptr per op. The flip caches
+			 * the killed ptr and promotes an equal number of
+			 * cached legs, so the extent never drops below
+			 * data_replicas authoritative copies; reconcile
+			 * re-evaluates the committed key and re-demotes
+			 * the remaining ptrs in later ops. The plain
+			 * (fused) path is unaffected in the common
+			 * one-ptr case and merely splits multi-ptr
+			 * demotes when the gate is enabled.
+			 */
 			if ((r->need_rb & BIT(BCH_RECONCILE_background_target)) &&
 			    !p.ptr.cached &&
-			    !bch2_dev_in_target_rcu(c, p.ptr.dev, r->background_target))
+			    !bch2_dev_in_target_rcu(c, p.ptr.dev, r->background_target) &&
+			    !(c->opts.demote_cached_leg && data_opts->ptrs_kill))
 				data_opts->ptrs_kill |= ptr_bit;
 
 			ptr_bit <<= 1;

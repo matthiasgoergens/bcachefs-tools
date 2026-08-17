@@ -132,6 +132,7 @@ bcachefs-y		:=			\
 	btree/write_buffer.o			\
 	data/checksum.o				\
 	data/compress.o				\
+	data/demote.o				\
 	data/copygc.o				\
 	data/ec/create.o			\
 	data/ec/init.o				\

@@ -77,6 +77,17 @@ struct bch_write_op {
 	struct bch_fs		*c;
 	void			(*end_io)(struct bch_write_op *);
 	u64			start_time;
+	/*
+	 * Durability-debt tickets per destination device (stage 2),
+	 * captured at write endio by bch2_journal_debt_add(): the flip of a
+	 * cached-leg demote waits for bch2_journal_debt_ticket_covered()
+	 * on each of the cached replica's devices. Only maintained for
+	 * move writes.
+	 */
+	u64			debt_tickets[BCH_SB_MEMBERS_MAX];
+	/* devices actually written by this op (move writes only; the
+	 * cached-leg destinations) - populated alongside debt_tickets */
+	struct bch_devs_mask	written_devs;
 
 #ifdef CONFIG_BCACHEFS_ASYNC_OBJECT_LISTS
 	unsigned		list_idx;

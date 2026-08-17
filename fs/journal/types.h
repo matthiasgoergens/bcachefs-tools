@@ -49,6 +49,31 @@ struct journal_buf {
 	 */
 	struct bch_dev		*cas[BCH_REPLICAS_MAX];
 	struct bch_devs_list	devs_written;
+	/*
+	 * Devices with durability debt (c->journal_debt) exchanged in when
+	 * this entry was picked as a flush write - the scoped-preflush
+	 * target set. Stage 1: validation only, the preflush itself still
+	 * goes to every rw member.
+	 */
+	struct bch_devs_mask	flush_devs;
+	/* Debt exchange generation captured at flush-pick time; advanced
+	 * into journal_completed_gen[dev] when this flush's preflushes
+	 * for dev complete successfully (stage 2 ticket plumbing):
+	 */
+	u64			exchange_gen;
+	/*
+	 * Dual-oracle validation (stage 1, shadow - see
+	 * bch2_journal_write_prep()):
+	 *
+	 * @dep_mask: devices holding authoritative (non-cached) ptrs of keys
+	 * journaled in this entry - the references this entry introduces.
+	 *
+	 * @flush_covers: flush writes only: snapshot of j->pending_deps
+	 * (incl. this entry) - the reference set this flush retroactively
+	 * covers. Checked against flush_devs (the endio-debt oracle).
+	 */
+	struct bch_devs_mask	dep_mask;
+	struct bch_devs_mask	flush_covers;
 	struct bch_io_failures	failed;
 
 	u64			last_seq;	/* copy of data->last_seq */
@@ -411,6 +436,15 @@ struct journal {
 	bool			can_discard;
 
 	unsigned long		last_flush_write;
+
+	/*
+	 * Walk-side accumulator of the stage-1 dual validator: union of the
+	 * dep masks of all journal writes since the last flush write prep -
+	 * devices holding authoritative ptrs the next flush must cover.
+	 * Accumulated and cleared (on flush) in bch2_journal_write_prep()
+	 * under j->lock; shadow only, the preflush is unchanged.
+	 */
+	struct bch_devs_mask	pending_deps;
 
 	u64			write_start_time;
 

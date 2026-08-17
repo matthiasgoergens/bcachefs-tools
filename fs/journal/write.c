@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "bcachefs.h"
+#include "data/demote.h"
 
 #include "alloc/discard.h"
 #include "alloc/disk_groups.h"
@@ -503,6 +504,8 @@ static CLOSURE_CALLBACK(journal_write_done_flush)
 {
 	closure_type(w, struct journal_buf, io);
 	struct journal *j = w->j;
+	struct bch_fs *c = container_of(j, struct bch_fs, journal);
+	unsigned dev;
 
 	/*
 	 * Wake up flush waiters early, if there wasn't an error:
@@ -516,6 +519,38 @@ static CLOSURE_CALLBACK(journal_write_done_flush)
 	if (!w->failed.nr && w->wait.list.first > JOURNAL_BUF_FLUSH_NO_WAIT) {
 		struct closure_waitlist	wait = {{ xchg(&w->wait.list.first, NULL) }};
 		closure_wake_up(&wait);
+	}
+
+	if (!w->failed.nr) {
+		/*
+		 * Stage-2 ticket plumbing: the dependency preflushes for the
+		 * devices in flush_devs completed successfully here (this
+		 * closure waits on them), so advance each covered device's
+		 * completion generation. Debt registrations waiting for
+		 * completed_gen >= ticket + 1 are released (bch2_journal_debt_add()).
+		 */
+		for_each_set_bit(dev, w->flush_devs.d, BCH_SB_MEMBERS_MAX) {
+			smp_store_release(&c->journal_completed_gen[dev],
+					  w->exchange_gen);
+			if (IS_ENABLED(CONFIG_BCACHEFS_DEBUG)) {
+				CLASS(bch_log_msg_ratelimited, msg)(c);
+				prt_printf(&msg.m, "debt advance: dev %u completed %llu\n",
+					   dev, w->exchange_gen);
+			}
+		}
+
+		bch2_demote_flip_wake(c);
+	} else {
+		/*
+		 * A dependency preflush that failed must not consume the
+		 * debt: restore the bits so the next flush covers those
+		 * devices again. Over-conservative - also restores on
+		 * journal-replica failures, which merely costs an extra
+		 * preflush round in an already-failing scenario. (The
+		 * separate-failure-mask refinement splits the two cases.)
+		 */
+		for_each_set_bit(dev, w->flush_devs.d, BCH_SB_MEMBERS_MAX)
+			set_bit(dev, c->journal_debt.d);
 	}
 
 	continue_at_nobarrier(cl, journal_write_done, j->wq);
@@ -653,6 +688,71 @@ static CLOSURE_CALLBACK(journal_write_preflush)
 	}
 }
 
+static void journal_devs_mask_to_text(struct printbuf *out,
+				      const struct bch_devs_mask *mask)
+{
+	bool first = true;
+	unsigned i;
+
+	for_each_set_bit(i, mask->d, BCH_SB_MEMBERS_MAX) {
+		if (!first)
+			prt_char(out, ',');
+		prt_printf(out, "%u", i);
+		first = false;
+	}
+	if (first)
+		prt_str(out, "(none)");
+}
+
+/*
+ * Walk the final jset and compute the devices it references: for every
+ * journaled key carrying extent pointers, for every authoritative
+ * (non-cached) ptr, set the device bit.
+ *
+ * Covered:
+ *  - extent keys (incl. reflink_v inline ptrs): non-cached ptrs only
+ *  - stripe keys: stripe block ptrs are plain bch_extent_ptr and never
+ *    have the cached bit set - parity is authoritative immediately
+ *  - btree ptr keys, in btree_keys and btree_root entries: btree node
+ *    writes are non-FUA, and the interior path journals the parent ptr
+ *    once the child write has merely completed - today the all-member
+ *    preflush is what makes those nodes durable before the journaled
+ *    pointer becomes durable (journal pins + seq blacklist cover only the
+ *    opposite direction)
+ *
+ * Deliberately not covered:
+ *  - overwrite entries: old values; their deps were accounted by the entry
+ *    that originally inserted the key
+ *  - log_bkey entries: structured logging, never replayed
+ *
+ * This walk is one oracle of the stage-1 dual validator; the other is the
+ * endio-side durability debt (c->journal_debt -> journal_buf.flush_devs).
+ * Neither can see the other's failure: the walk cannot see unjournaled
+ * writes, the debt cannot see what the jset references.
+ */
+static void journal_jset_dep_mask(struct bch_fs *c, struct jset *jset,
+				  struct bch_devs_mask *deps)
+{
+	vstruct_for_each(jset, i) {
+		if (i->type != BCH_JSET_ENTRY_btree_keys &&
+		    i->type != BCH_JSET_ENTRY_write_buffer_keys &&
+		    i->type != BCH_JSET_ENTRY_btree_root)
+			continue;
+
+		jset_entry_for_each_key(i, k) {
+			struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(bkey_i_to_s_c(k));
+
+			bkey_for_each_ptr(ptrs, ptr) {
+				if (ptr->cached)
+					continue;
+
+				if (likely(ptr->dev < BCH_SB_MEMBERS_MAX))
+					__set_bit(ptr->dev, deps->d);
+			}
+		}
+	}
+}
+
 static int bch2_journal_write_prep(struct journal *j, struct journal_buf *w)
 {
 	struct bch_fs *c = container_of(j, struct bch_fs, journal);
@@ -765,6 +865,86 @@ static int bch2_journal_write_prep(struct journal *j, struct journal_buf *w)
 		return bch_err_throw(c, EINVAL_journal_write_overran_available_space);
 	}
 
+	/*
+	 * Stage-1 dual-oracle validation (scoped preflush, shadow mode):
+	 *
+	 * Walk-side: accumulate this entry's referenced-device mask into
+	 * j->pending_deps; a flush write snapshots pending (incl. its own)
+	 * into w->flush_covers and clears the accumulator. j->lock
+	 * serializes accumulate/clear against concurrent write preps (j->wq
+	 * is WQ_PERCPU, so consecutive noflush seqs may prep concurrently).
+	 * A flush write's prep cannot race a later entry's accumulate: the
+	 * next write only starts after this one's seq is on disk.
+	 *
+	 * Debt-side: w->flush_devs was exchanged out of c->journal_debt at
+	 * flush-pick time (bch2_journal_do_writes_locked()).
+	 *
+	 * The check: everything the journal referenced since the last flush
+	 * must be within the debt this flush collected (journal devices are
+	 * always in coverage - their writes are the flush-carriers
+	 * themselves). WARN-only and DEBUG-only in this stage: a jset can
+	 * legitimately reference OLD data (e.g. an updated extent key that
+	 * keeps an authoritative ptr to data written before the last flush
+	 * - mark-cached, trigger updates) whose device has no current debt
+	 * and needs none, because an earlier flush already made it durable.
+	 * Eliminating that stale-reference class (tracking changed-since-
+	 * last-flush) is stage-3 precision work; until then this validator
+	 * catches the catastrophic case - an endio class whose debt is
+	 * never registered at all - not every theoretically-missed bit.
+	 */
+	struct bch_devs_mask deps = {};
+	journal_jset_dep_mask(c, jset, &deps);
+
+	bool flush = !JSET_NO_FLUSH(jset);
+
+	scoped_guard(spinlock, &j->lock) {
+		bitmap_or(j->pending_deps.d, j->pending_deps.d, deps.d,
+			  BCH_SB_MEMBERS_MAX);
+		if (flush) {
+			w->flush_covers = j->pending_deps;
+			j->pending_deps = (struct bch_devs_mask) {};
+		}
+	}
+	w->dep_mask = deps;
+
+	event_trace(c, journal_write_deps, buf, ({
+		prt_printf(&buf, "seq %llu flush %u deps ",
+			   le64_to_cpu(jset->seq), flush);
+		journal_devs_mask_to_text(&buf, &deps);
+		if (flush) {
+			prt_str(&buf, " walk ");
+			journal_devs_mask_to_text(&buf, &w->flush_covers);
+			prt_str(&buf, " debt ");
+			journal_devs_mask_to_text(&buf, &w->flush_devs);
+		}
+	}));
+
+	if (IS_ENABLED(CONFIG_BCACHEFS_DEBUG) && flush) {
+		struct bch_devs_mask coverable, uncovered;
+
+		bitmap_or(coverable.d, w->flush_devs.d,
+			  c->allocator.rw_devs[BCH_DATA_journal].d,
+			  BCH_SB_MEMBERS_MAX);
+		bitmap_andnot(uncovered.d, w->flush_covers.d, coverable.d,
+			      BCH_SB_MEMBERS_MAX);
+
+		if (!bitmap_empty(uncovered.d, BCH_SB_MEMBERS_MAX)) {
+			CLASS(bch_log_msg_ratelimited, msg)(c);
+
+			prt_printf(&msg.m,
+				   "journal write seq %llu: referenced devs outside debt coverage (stale-reference class possible, see comment)\n",
+				   le64_to_cpu(jset->seq));
+			prt_str(&msg.m, "uncovered: ");
+			journal_devs_mask_to_text(&msg.m, &uncovered);
+			prt_newline(&msg.m);
+			prt_str(&msg.m, "walk: ");
+			journal_devs_mask_to_text(&msg.m, &w->flush_covers);
+			prt_newline(&msg.m);
+			prt_str(&msg.m, "debt: ");
+			journal_devs_mask_to_text(&msg.m, &w->flush_devs);
+		}
+	}
+
 	return 0;
 }
 
@@ -817,6 +997,7 @@ CLOSURE_CALLBACK(bch2_journal_write)
 	struct journal *j = w->j;
 	struct bch_fs *c = container_of(j, struct bch_fs, journal);
 	unsigned nr_rw_members = dev_mask_nr(&c->allocator.rw_devs[BCH_DATA_free]);
+	unsigned dev;
 	int ret;
 
 	BUG_ON(!w->write_started);
@@ -914,6 +1095,16 @@ CLOSURE_CALLBACK(bch2_journal_write)
 		continue_at_nobarrier(cl, journal_write_submit, NULL);
 	return;
 err:
+	/*
+	 * The flush-write pick exchanged the durability debt into
+	 * w->flush_devs, but this write is aborted before its dependency
+	 * preflushes were issued - restore the debt so the next flush
+	 * write covers it. A failed or abandoned preflush must not
+	 * consume the debt.
+	 */
+	for_each_set_bit(dev, w->flush_devs.d, BCH_SB_MEMBERS_MAX)
+		set_bit(dev, c->journal_debt.d);
+
 	if (1) {
 		CLASS(bch_log_msg, msg)(c);
 		msg.m.suppress = true; /* only print once, when we go ERO */
@@ -926,6 +1117,9 @@ err:
 		bch2_fs_emergency_read_only(c, &msg.m);
 	}
 no_io:
+	for_each_set_bit(dev, w->flush_devs.d, BCH_SB_MEMBERS_MAX)
+		set_bit(dev, c->journal_debt.d);
+
 	{
 		unsigned ptr_idx = 0;
 		extent_for_each_ptr(bkey_i_to_s_extent(&w->key), ptr) {
@@ -1117,6 +1311,23 @@ void bch2_journal_do_writes_locked(struct journal *j)
 
 			clear_bit(JOURNAL_need_flush_write, &j->flags);
 			j->flushes_outstanding++;
+
+			/*
+			 * Scoped preflush (stage 1, shadow): collect the
+			 * outstanding durability debt this flush will cover.
+			 * The exchange is atomic; debt registered from here
+			 * on belongs to the next flush epoch - those writes'
+			 * keys cannot be in this entry, which is sealed (no
+			 * open reservations, and publication follows endio).
+			 *
+			 * The preflush itself still goes to every rw member;
+			 * this set feeds the validator until stage 3 narrows
+			 * journal_write_preflush() to it.
+			 */
+			w->exchange_gen = ++c->journal_exchange_gen;
+
+			for (unsigned i = 0; i < BITS_TO_LONGS(BCH_SB_MEMBERS_MAX); i++)
+				w->flush_devs.d[i] = xchg(&c->journal_debt.d[i], 0);
 
 			/*
 			 * (Re-)arm the auto-commit timer: if nothing else

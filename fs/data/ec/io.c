@@ -443,6 +443,15 @@ static void ec_block_endio(struct bio *bio)
 	else if (dev_ptr_stale(ca, ptr))
 		buf->err[STRIPE_BUF_PRE_RECOV][ec_bio->idx] = bch_err_throw(ca->fs, stripe_read_ptr_stale);
 
+	/*
+	 * Stripe block writes complete before the stripe key (and any
+	 * extent keys referencing it) is committed: non-FUA success leaves
+	 * durability debt for the next flushing journal write.
+	 */
+	if (ca && rw == WRITE && likely(!bio->bi_status) &&
+	    !(bio->bi_opf & REQ_FUA))
+		bch2_journal_debt_add(ca->fs, ca->dev_idx);
+
 	bio_put(&ec_bio->bio);
 	enumerated_ref_put(&ca->io_ref[rw], ref);
 	closure_put(&buf->io);

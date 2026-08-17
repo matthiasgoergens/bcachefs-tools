@@ -739,6 +739,38 @@ struct bch_fs {
 	struct bch_devs_mask	devs_removed;
 	struct bch_devs_mask	devs_rotational;
 
+	/*
+	 * Journal durability debt: one bit per device, set at write endio
+	 * when a write whose key may be journaled completes without FUA.
+	 * Atomically exchanged into journal_buf.flush_devs when a flush
+	 * write is picked (journal/write.c); bits set after the exchange
+	 * belong to the next flush epoch - their keys cannot be in the
+	 * already-sealed entry, because publication always follows endio
+	 * (btree interior updates, move index updates and foreground
+	 * write-index updates all run off endio-driven closures).
+	 *
+	 * Scoped preflush stage 1 is shadow accounting: the preflush still
+	 * goes to every rw member; this mask feeds the validator.
+	 */
+	struct bch_devs_mask	journal_debt;
+	/*
+	 * Durability-debt ticket plumbing (stage 2): one exchange generation,
+	 * incremented once per debt-exchange event under j->lock, plus
+	 * per-device completion generations advanced when a flush that
+	 * exchanged a device's debt completes with its preflushes successful.
+	 * A debt registration records the exchange generation after setting
+	 * its bit; it is covered once the device's completion generation
+	 * passes the ticket + 1 (see bch2_journal_debt_add()).
+	 */
+	u64			journal_exchange_gen;
+	u64			journal_completed_gen[BCH_SB_MEMBERS_MAX];
+	/* Stage-2 cached-leg demote flip queue (data/demote.c): */
+	spinlock_t		demote_flips_lock;
+	struct list_head	demote_flips;
+	unsigned		demote_flips_pending;
+	struct delayed_work	demote_flip_work;
+
+	/* Stage-2 cached-leg demote flip queue (data/demote.c): */
 	struct bch_opts		opts;
 	struct mutex		opt_change_lock;
 	u32			opt_change_cookie;
@@ -860,6 +892,44 @@ struct bch_fs {
 	struct btree_debug	btree_debug[BTREE_ID_NR];
 #endif
 };
+
+/*
+ * Register durability debt: a write that a journaled key may reference
+ * completed on device @dev without FUA, so the next flushing journal
+ * write must flush that device before becoming durable.
+ *
+ * Must be called in the write's endio (before any publication work is
+ * queued): a journal entry may only reference writes that completed
+ * before it was sealed, so debt set here always precedes the exchange
+ * into journal_buf.flush_devs of the flush that covers it.
+ */
+static inline u64 bch2_journal_debt_add(struct bch_fs *c, unsigned dev)
+{
+	/*
+	 * Ticket protocol (read BEFORE the bit is set; smp_mb orders the
+	 * read before the set). Any exchange with gen >= ticket + 1 runs
+	 * after this registration, hence after the write's completion, so
+	 * its preflush covers the write; the exchange's xchg (a full
+	 * barrier) makes the gen increment visible before it can take the
+	 * bit. completed_gen >= ticket + 1 therefore releases exactly when
+	 * a covering exchange completes. An exchange that ran entirely
+	 * before the registration cannot advance completed_gen past the
+	 * ticket, because it either did not include the device or included
+	 * it only via other debt whose preflush also covered this write.
+	 */
+	u64 ticket = READ_ONCE(c->journal_exchange_gen);
+
+	smp_mb();
+	set_bit(dev, c->journal_debt.d);
+
+	return ticket;
+}
+
+static inline bool bch2_journal_debt_ticket_covered(struct bch_fs *c,
+						    unsigned dev, u64 ticket)
+{
+	return smp_load_acquire(&c->journal_completed_gen[dev]) >= ticket + 1;
+}
 
 /* Error tracking: */
 

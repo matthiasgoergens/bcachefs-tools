@@ -209,6 +209,15 @@ static void btree_node_write_endio(struct bio *bio)
 	}
 
 	/*
+	 * Btree node writes are never FUA: a successful completion leaves
+	 * durability debt the next flushing journal write must cover - the
+	 * parent ptr to this node is journaled from btree_node_write_work,
+	 * which runs off this endio.
+	 */
+	if (ca && likely(!bio->bi_status))
+		bch2_journal_debt_add(c, wbio->dev);
+
+	/*
 	 * XXX: we should be using io_ref[WRITE], but we aren't retrying failed
 	 * btree writes yet (due to device removal/ro):
 	 */

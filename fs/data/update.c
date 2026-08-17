@@ -10,6 +10,7 @@
 #include "btree/update.h"
 
 #include "data/compress.h"
+#include "data/demote.h"
 #include "data/copygc.h"
 #include "data/extents.h"
 #include "data/keylist.h"
@@ -403,7 +404,15 @@ static int data_update_index_update_key(struct btree_trans *trans,
 
 	try(bch2_bkey_drop_extra_durability(trans, &opts,	insert, ~0, false));
 
-	bch2_bkey_drop_extra_cached_ptrs(c, &opts, bkey_i_to_s(insert));
+	/*
+	 * flip-demote: the cached leg on the background target is the
+	 * whole point - the generic extra-cached drop would remove it
+	 * ("incorrect target": it is not in the promote/foreground
+	 * target). The flip, or the reconcile cached cleanup after a
+	 * lost flip, owns its lifetime instead.
+	 */
+	if (!u->flip_ptrs_kill)
+		bch2_bkey_drop_extra_cached_ptrs(c, &opts, bkey_i_to_s(insert));
 
 	bch2_bkey_propagate_incompressible(c, insert, k);
 
@@ -772,6 +781,9 @@ static void data_update_trace(struct data_update *u, int ret)
 void bch2_data_update_exit(struct data_update *update, int ret)
 {
 	data_update_trace(update, ret);
+
+	if (!ret)
+		bch2_demote_flip_arm(update);
 
 	struct bch_fs *c = update->op.c;
 	struct bkey_s_c k = bkey_i_to_s_c(update->k.k);
@@ -1379,21 +1391,24 @@ int bch2_data_update_init(struct btree_trans *trans,
 	unsigned buf_bytes = 0;
 	bool unwritten = false;
 	unsigned durability_keeping = 0;
+	unsigned durability_total = 0;
 
 	if (m->opts.ptrs_kill)
 		checksummed_and_non_checksummed_handling(m, ptrs);
 
 	unsigned ptr_bit = 1;
 	bkey_for_each_ptr_decode(k.k, ptrs, p, entry) {
-		if (!(ptr_bit & m->opts.ptrs_kill)) {
-			int d = ptr_bit & m->opts.ptrs_kill_ec
-				? bch2_dev_durability(c, p.ptr.dev)
-				: bch2_extent_ptr_durability(trans, &p);
-			if (d < 0) {
-				ret = d;
-				goto out;
-			}
+		int d = ptr_bit & m->opts.ptrs_kill_ec
+			? bch2_dev_durability(c, p.ptr.dev)
+			: bch2_extent_ptr_durability(trans, &p);
+		if (d < 0) {
+			ret = d;
+			goto out;
+		}
 
+		durability_total += d;
+
+		if (!(ptr_bit & m->opts.ptrs_kill)) {
 			durability_keeping += d;
 			if (!m->opts.no_devs_have && !p.ptr.cached)
 				bch2_dev_list_add_dev(&m->op.devs_have, p.ptr.dev);
@@ -1422,6 +1437,119 @@ int bch2_data_update_init(struct btree_trans *trans,
 		unwritten |= p.ptr.unwritten;
 
 		ptr_bit <<= 1;
+	}
+
+	/*
+	 * Stage-2 cached-leg demote: write the new background-target
+	 * replica as a cached copy (all current ptrs stay authoritative)
+	 * and defer dropping the source ptrs to the flip, which waits for
+	 * the replica's durability-debt coverage. Gated on the
+	 * demote_cached_leg option and on the checksummed-COW predicate:
+	 * the extent must be at full durability (the flip never drops
+	 * below data_replicas authoritative copies), not nocow, non-EC,
+	 * and every ptr checksummed (a cached replica is only trustworthy
+	 * if its content can be verified on read).
+	 */
+	if (c->opts.demote_cached_leg &&
+	    m->opts.type == BCH_DATA_UPDATE_reconcile &&
+	    m->opts.ptrs_kill &&
+	    m->opts.target != io_opts->foreground_target &&
+	    !io_opts->nocow &&
+	    durability_total == io_opts->data_replicas &&
+	    bch2_demote_flip_room(c)) {
+		bool eligible = true;
+
+		bkey_for_each_ptr_decode(k.k, ptrs, p, entry)
+			if (p.has_ec || p.ptr.unwritten || !p.crc.csum_type) {
+				eligible = false;
+				break;
+			}
+
+		/*
+		 * The flip's legs land on background_target devices and
+		 * must cover the durability of the ptrs they kill. If no
+		 * target device can match a killed ptr's durability, the
+		 * try-time subset kill could never kill it and the demote
+		 * would loop forever - decline and let the fused path
+		 * handle the imbalance with its own accounting. (An
+		 * over-replicated extent is declined above via the ==
+		 * check, so the index update's extra-durability drop
+		 * cannot shift ptr positions under the flip's mask.)
+		 */
+		scoped_guard(rcu) {
+			/*
+			 * Every device the allocator may pick for the leg
+			 * (m->opts.target - the write's actual target, not
+			 * the option) must be able to cover a killed ptr:
+			 * a leg on a weaker device would leave the
+			 * try-time subset kill with nothing coverable -
+			 * the flip drops, reconcile re-demotes, the gate
+			 * passes again: a livelock. The minimum, not the
+			 * maximum, decides; the fused path's durability
+			 * accounting handles declined extents.
+			 */
+			const struct bch_devs_mask *tmask =
+				bch2_target_to_mask(c, m->opts.target);
+			unsigned target_min = UINT_MAX;
+			for_each_member_device_rcu(c, ca, tmask)
+				target_min = min(target_min, ca->mi.durability);
+
+			unsigned ptr_bit2 = 1;
+			bkey_for_each_ptr_decode(k.k, ptrs, p, entry) {
+				if ((ptr_bit2 & m->opts.ptrs_kill) &&
+				    bch2_dev_durability(c, p.ptr.dev) > target_min) {
+					eligible = false;
+					break;
+				}
+				ptr_bit2 <<= 1;
+			}
+		}
+
+		if (eligible) {
+			m->flip_ptrs_kill	= m->opts.ptrs_kill;
+			m->opts.ptrs_kill	= 0;
+			/*
+			 * Write one cached leg per ptr the flip will kill:
+			 * the flip's atomic key update promotes the legs
+			 * and caches the killed ptrs together, so the
+			 * authoritative count never drops below
+			 * data_replicas (stage-2 staged-flip invariant;
+			 * the selector caps the kill at one ptr per op,
+			 * but mixed kills - e.g. checksum plus target -
+			 * can still carry two bits).
+			 */
+			m->opts.extra_replicas	= hweight_long(m->flip_ptrs_kill);
+
+			/*
+			 * The killed ptrs stay authoritative until the flip
+			 * caches them, so the extent keeps its full
+			 * durability until then: durability_keeping above
+			 * was computed with the original ptrs_kill and
+			 * counts nothing. Count everything as keeping -
+			 * the new leg must be written cached, or the flip's
+			 * have_leg check never finds it (the leg would be
+			 * authoritative), and nr_replicas below would also
+			 * over-allocate. Measured: every flip arm dropped
+			 * with "no leg", and the demote looped forever.
+			 */
+			durability_keeping = durability_total;
+			/* op.flags, not just write_flags: the flag was already
+			 * copied into op.flags above this point, and the
+			 * written ptr's cached bit comes from op.flags */
+			m->op.flags		|= BCH_WRITE_cached;
+			m->opts.write_flags	|= BCH_WRITE_cached;
+
+			/* all current ptrs remain authoritative pre-flip, so
+			 * devs_have must reflect them all (the loop above
+			 * skipped the to-be-killed ptrs) */
+			ptr_bit = 1;
+			bkey_for_each_ptr_decode(k.k, ptrs, p, entry) {
+				if ((ptr_bit & m->flip_ptrs_kill) && !p.ptr.cached)
+					bch2_dev_list_add_dev(&m->op.devs_have,
+							      p.ptr.dev);
+				ptr_bit <<= 1;
+			}
+		}
 	}
 
 	if (m->opts.type != BCH_DATA_UPDATE_scrub &&
@@ -1563,12 +1691,15 @@ void bch2_fs_data_update_exit(struct bch_fs *c)
 {
 	if (c->update_table.ht.tbl)
 		rhltable_destroy(&c->update_table);
+	bch2_demote_flip_exit(c);
 }
 
 int bch2_fs_data_update_init(struct bch_fs *c)
 {
 	if (rhltable_init(&c->update_table, &bch_update_params))
 		return bch_err_throw(c, ENOMEM_promote_table_init);
+
+	bch2_demote_flip_init(c);
 
 	return 0;
 }

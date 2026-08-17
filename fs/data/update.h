@@ -47,6 +47,13 @@ struct data_update {
 	enum btree_id		btree_id;
 	struct bkey_buf		k;
 	struct data_update_opts	opts;
+	/*
+	 * Cached-leg demote (stage 2): the ptrs the fused path would have
+	 * killed, deferred to the flip once the cached replica's durability
+	 * debt is discharged. Zero when this update is not a cached-leg
+	 * demote.
+	 */
+	unsigned		flip_ptrs_kill;
 
 	bool			on_hashtable;
 	bool			read_done;
